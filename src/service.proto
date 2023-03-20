@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: 2023 RizinOrg <info@rizin.re>
+// SPDX-FileCopyrightText: 2023 deroad <wargio@libero.it>
+// SPDX-License-Identifier: LGPL-3.0-only
+// protoc-c --c_out=. service.proto
+
+syntax = "proto3";
+
+/* generics */
+
+enum Route {
+  PING = 0;
+  BINARY = 1;
+  SIGNATURE = 2;
+  SHARE_BIN = 3;
+}
+
+enum Status {
+  INTERNAL_ERROR = 0;
+  CLIENT_BAD_PRE_SHARED_KEY = 1;
+  CLIENT_NOT_AUTHORIZED = 2;
+  VERSION_MISMATCH = 3;
+  SHARE_WAS_SUCCESSFUL = 4;
+  MESSAGE = 5;
+  HINTS = 6;
+  SYMBOL = 7;
+}
+
+message Hint {
+  uint32 bits = 1; // hint function arch bits
+  uint64 offset = 2; // hint function offset
+}
+
+message Symbol {
+  string name = 1; // function name
+  string signature = 2; // function signature `type name(type arg0)`
+  string callconv = 3; // function calling convention
+  uint32 bits = 4; // function arch bits
+}
+
+/* client messages used to request info to the server */
+
+message SectionHash {
+  uint32 size = 1; // binary section size
+  bytes digest = 2; // binary section digest
+}
+
+message Binary {
+  string type = 1; // binary type
+  string os = 2; // binary os
+  repeated SectionHash sections = 3;
+}
+
+message Signature {
+  string arch = 1; // architecture name
+  uint32 bits = 2; // architecture bits
+  uint32 length = 3; // function length
+  bytes digest = 4; // function digest of the masked bytes
+}
+
+/* client messages used to upload info to the server */
+
+message ShareSymbol {
+  Symbol symbol = 1; // symbol info
+  Signature signature = 2; // symbol signature
+}
+
+message ShareSection {
+  string name = 1; // binary section name
+  SectionHash section = 2; // binary section
+  repeated Hint hints = 3; // binary section hints
+}
+
+message ShareBin {
+  string type = 1; // binary type
+  string os = 2; // binary os
+  repeated ShareSection sections = 3; // binary sections
+  repeated ShareSymbol symbols = 4; // binary symbols
+}
+
+/* client request generics */
+
+message Request {
+  string psk = 1; // authorization
+  uint32 version = 2; // protocol version
+  Route route = 3; // protocol route
+  bytes message = 4; // client encoded message based on the route
+}
+
+/* server messages used to reply to the client */
+
+message Message {
+  string text = 1; // server text
+}
+
+message MatchHints {
+  repeated Hint hints = 1; // matched section hints
+}
+
+message Response {
+  Status status = 1; // server status
+  bytes message = 2; // server encoded message based on the status
+}
