@@ -109,7 +109,7 @@ RZ_IPI bool sil_plugin_analysis(RzCore *core) {
 	sil_stats_t stats = { 0 };
 	rz_core_notify_begin(core, "Resolving symbols using the silhouette server...");
 	bool result = sil_resolve_functions(sil, core, &stats);
-	rz_core_notify_done(core, "Applied %u hints and %u symbols.", stats.hints, stats.symbols);
+	rz_core_notify_done(core, "Applied %u hints and %u symbols using the silhouette server.", stats.hints, stats.symbols);
 
 	sil_free(sil);
 	return result;
