@@ -6,9 +6,7 @@ For more info about the server please check the repo [rz-silhouette-server](http
 
 ## Public Servers
 
-- `eu-symbols.rizin.re`
-    - port: `25443` TLS and insecure `25000`
-    - public psk `PublicAccess`
+- [eu-symbols.rizin.re](https://eu-symbols.rizin.re)
 
 ## Setup
 
