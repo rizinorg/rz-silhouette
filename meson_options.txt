@@ -1,1 +1,2 @@
 option('rizin_plugdir', type: 'string', value: '', description: 'rizin plugin install directory')
+option('use_sys_protobuf_c', type: 'feature', value: 'disabled')
