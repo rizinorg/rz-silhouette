@@ -28,7 +28,3 @@ To test if the credentials are correct, you can open rizin and execute the follo
 Hello World from the server!
 response delay: 2.5ms
 ```
-
-## Dependencies
-
-To build this tool, it requires `libprotobuf-c` and `pthreads`
