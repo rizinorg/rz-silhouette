@@ -48,19 +48,19 @@ static const RzCmdDescHelp sil_command_help = {
 
 static sil_t *sil_plugin_create(RzCore *core) {
 	sil_opt_t opts = {
-		psk : rz_config_get(core->config, RZ_SIL_PSK),
-		address : rz_config_get(core->config, RZ_SIL_HOST),
-		port : rz_config_get(core->config, RZ_SIL_PORT),
-		timeout : rz_config_get_i(core->config, RZ_SIL_TIMEOUT),
+		.psk = rz_config_get(core->config, RZ_SIL_PSK),
+		.address = rz_config_get(core->config, RZ_SIL_HOST),
+		.port = rz_config_get(core->config, RZ_SIL_PORT),
+		.timeout = rz_config_get_i(core->config, RZ_SIL_TIMEOUT),
 #if HAVE_LIB_SSL
-		use_tls : rz_config_get_b(core->config, RZ_SIL_TLS),
+		.use_tls = rz_config_get_b(core->config, RZ_SIL_TLS),
 #else
-		use_tls : false,
+		.use_tls = false,
 #endif
-		show_msg : rz_config_get_b(core->config, RZ_SIL_SRV_TEXT),
-		can_share : rz_config_get_b(core->config, RZ_SIL_SHARE),
-		can_share_sections : rz_config_get_b(core->config, RZ_SIL_SHARE_SECTIONS),
-		can_share_symbols : rz_config_get_b(core->config, RZ_SIL_SHARE_SYMBOLS),
+		.show_msg = rz_config_get_b(core->config, RZ_SIL_SRV_TEXT),
+		.can_share = rz_config_get_b(core->config, RZ_SIL_SHARE),
+		.can_share_sections = rz_config_get_b(core->config, RZ_SIL_SHARE_SECTIONS),
+		.can_share_symbols = rz_config_get_b(core->config, RZ_SIL_SHARE_SYMBOLS),
 	};
 	return sil_new(&opts);
 }
