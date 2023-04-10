@@ -43,6 +43,7 @@ protobuf_c_src = [
 
 protobuf_c_incs = [
   'protobuf-c',
+  '.',
 ]
 
 protobuf_c_lib = static_library('libprotobuf-c', protobuf_c_src,
