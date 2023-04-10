@@ -1,0 +1,4 @@
+[wrap-git]
+url = https://github.com/protobuf-c/protobuf-c.git
+revision = v1.4.1
+patch_directory = protobuf-c

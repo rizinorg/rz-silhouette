@@ -10,10 +10,25 @@ project('rz_silhouette', 'c',
 cc = meson.get_compiler('c')
 rz_core_dep = dependency('rz_core')
 
+
+# handle yara library
+sys_protobuf_c_opt = get_option('use_sys_protobuf_c')
+protobuf_c_dep = disabler()
+if sys_protobuf_c_opt.enabled() or sys_protobuf_c_opt.auto()
+  protobuf_c_dep = dependency('libprotobuf-c', required: false)
+  if not protobuf_c_dep.found()
+    protobuf_c_dep = cc.find_library('libprotobuf-c', required: sys_protobuf_c_opt)
+  endif
+endif
+if (sys_protobuf_c_opt.auto() and not protobuf_c_dep.found()) or sys_protobuf_c_opt.disabled()
+  protobuf_c_proj = subproject('protobuf-c', default_options: ['default_library=static'])
+  protobuf_c_dep = protobuf_c_proj.get_variable('protobuf_c_dep')
+endif
+
 rz_silhouette_deps = [
   rz_core_dep,
   dependency('threads', required: true),
-  dependency('libprotobuf-c', required: true),
+  protobuf_c_dep,
 ]
 
 rz_silhouette_incs = [
