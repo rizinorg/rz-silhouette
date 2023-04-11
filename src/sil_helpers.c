@@ -34,7 +34,7 @@ void proto_section_hash_free(SectionHash *message) {
 	free(message);
 }
 
-SectionHash *proto_section_hash_new(ut32 size, ut8 *digest, size_t digest_size) {
+SectionHash *proto_section_hash_new(ut32 size, ut64 paddr, ut8 *digest, size_t digest_size) {
 	SectionHash *message = RZ_NEW0(SectionHash);
 	if (!message) {
 		return NULL;
@@ -42,6 +42,7 @@ SectionHash *proto_section_hash_new(ut32 size, ut8 *digest, size_t digest_size) 
 	section_hash__init(message);
 
 	message->size = size;
+	message->paddr = paddr;
 	message->digest.data = digest;
 	message->digest.len = digest_size;
 	return message;

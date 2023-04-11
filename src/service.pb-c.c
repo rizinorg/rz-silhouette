@@ -675,7 +675,7 @@ const ProtobufCMessageDescriptor symbol__descriptor =
   (ProtobufCMessageInit) symbol__init,
   NULL,NULL,NULL    /* reserved[123] */
 };
-static const ProtobufCFieldDescriptor section_hash__field_descriptors[2] =
+static const ProtobufCFieldDescriptor section_hash__field_descriptors[3] =
 {
   {
     "size",
@@ -690,8 +690,20 @@ static const ProtobufCFieldDescriptor section_hash__field_descriptors[2] =
     0,NULL,NULL    /* reserved1,reserved2, etc */
   },
   {
-    "digest",
+    "paddr",
     2,
+    PROTOBUF_C_LABEL_NONE,
+    PROTOBUF_C_TYPE_UINT64,
+    0,   /* quantifier_offset */
+    offsetof(SectionHash, paddr),
+    NULL,
+    NULL,
+    0,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
+  {
+    "digest",
+    3,
     PROTOBUF_C_LABEL_NONE,
     PROTOBUF_C_TYPE_BYTES,
     0,   /* quantifier_offset */
@@ -703,13 +715,14 @@ static const ProtobufCFieldDescriptor section_hash__field_descriptors[2] =
   },
 };
 static const unsigned section_hash__field_indices_by_name[] = {
-  1,   /* field[1] = digest */
+  2,   /* field[2] = digest */
+  1,   /* field[1] = paddr */
   0,   /* field[0] = size */
 };
 static const ProtobufCIntRange section_hash__number_ranges[1 + 1] =
 {
   { 1, 0 },
-  { 0, 2 }
+  { 0, 3 }
 };
 const ProtobufCMessageDescriptor section_hash__descriptor =
 {
@@ -719,7 +732,7 @@ const ProtobufCMessageDescriptor section_hash__descriptor =
   "SectionHash",
   "",
   sizeof(SectionHash),
-  2,
+  3,
   section_hash__field_descriptors,
   section_hash__field_indices_by_name,
   1,  section_hash__number_ranges,

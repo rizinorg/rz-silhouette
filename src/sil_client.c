@@ -191,11 +191,23 @@ fail:
 
 static void sil_apply_match_hints(RzCore *core, const MatchHints *matches, sil_stats_t *stats) {
 	RzAnalysisFunction *func = NULL;
+	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
+	RzBinObject *bo = rz_bin_cur_object(core->bin);
+	if (!bo) {
+		RZ_LOG_ERROR("silhouette: failed to get bin object\n");
+		return;
+	}
+
 	for (size_t i = 0; i < matches->n_hints; ++i) {
 		const Hint *hint = matches->hints[i];
-		rz_core_analysis_function_add(core, NULL, hint->offset, false);
+		if (!hint) {
+			continue;
+		}
+		ut64 address = is_va ? rz_bin_object_p2v(bo, hint->offset) : hint->offset;
 
-		func = rz_analysis_get_function_at(core->analysis, hint->offset);
+		rz_core_analysis_function_add(core, NULL, address, false);
+
+		func = rz_analysis_get_function_at(core->analysis, address);
 		if (!func) {
 			// something wrong happened here.
 			// we skip applying the matches.
@@ -273,6 +285,7 @@ static char *propose_function_name(RzAnalysis *analysis, RzAnalysisFunction *fcn
 
 static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *fcn) {
 	RzAnalysis *analysis = core->analysis;
+	const bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
 	const char *prefix = rz_config_get(core->config, RZ_ANALYSIS_FCN_PREFIX);
 	if (RZ_STR_ISEMPTY(prefix)) {
 		prefix = "fcn";
@@ -298,7 +311,7 @@ static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *f
 
 	size_t offset = !strncmp(name, "sym.", strlen("sym.")) ? strlen("sym.") : 0;
 
-	ut64 paddr = rz_io_v2p(core->io, fcn->addr);
+	ut64 paddr = is_va ? rz_bin_object_v2p(bf->o, fcn->addr) : fcn->addr;
 	RzBinSymbol *symbol = rz_bin_symbol_new(name + offset, paddr, fcn->addr);
 	if (!symbol) {
 		RZ_LOG_ERROR("Failed allocate new go symbol\n");
@@ -314,7 +327,7 @@ static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *f
 	}
 }
 
-static void sil_apply_symbol(RzCore *core, RzAnalysisFunction *fcn, const Symbol *symbol, sil_stats_t *stats) {
+static void sil_apply_symbol(RzCore *core, RzAnalysisFunction *fcn, Symbol *symbol, sil_stats_t *stats) {
 	char *name = NULL;
 	if (!symbol) {
 		return;
@@ -338,6 +351,9 @@ static void sil_apply_symbol(RzCore *core, RzAnalysisFunction *fcn, const Symbol
 
 	// apply function signature
 	if (!RZ_STR_ISEMPTY(symbol->signature)) {
+		// strip any `sym.` and remove `.` from the signature. 
+		symbol->signature = rz_str_replace(symbol->signature, "sym.", "", 0);
+		rz_str_replace_ch(symbol->signature, '.', '_', 1);
 		if (!rz_analysis_function_set_type_str(core->analysis, fcn, symbol->signature)) {
 			RZ_LOG_ERROR("silhouette: failed to set signature '%s' for '%s'.\n", symbol->signature, name);
 		}
@@ -433,7 +449,7 @@ static SectionHash *sil_section_digest(RzCore *core, RzBinSection *bsect, const 
 	blake->small_block(data, bsect->size, &dgst, &size);
 	free(data);
 
-	SectionHash *message = proto_section_hash_new(bsect->size, dgst, size);
+	SectionHash *message = proto_section_hash_new(bsect->size, bsect->paddr, dgst, size);
 	if (!message) {
 		RZ_LOG_ERROR("silhouette: failed to allocate SectionHash\n");
 		return NULL;
@@ -541,13 +557,22 @@ fail:
 
 static ut32 rz_section_hash(const void *k) {
 	RzBinSection *section = (RzBinSection *)k;
-	return sdb_hash(section->name);
+	ut32 hash = sdb_hash(section->name);
+	ut32 high = section->paddr >> 32;
+	ut32 low = section->paddr & UT32_MAX;
+	hash ^= low;
+	hash ^= high;
+	return hash;
 }
 
 static int rz_section_cmp(const void *a, const void *b) {
 	const RzBinSection *sa = (const RzBinSection *)a;
 	const RzBinSection *sb = (const RzBinSection *)b;
-	return strcmp(sa->name, sb->name);
+	int ret = strcmp(sa->name, sb->name);
+	if (ret) {
+		return ret;
+	}
+	return sb->paddr - sa->paddr;
 }
 
 static bool sil_has_symbols(RzAnalysis *analysis, RzBinObject *bo) {
@@ -572,11 +597,12 @@ static bool sil_send_share_bin(sil_t *sil, RzCore *core) {
 	const RzHashPlugin *blake = NULL;
 	HtPP *ht = NULL;
 	HtPPOptions opt = { 0 };
+	RzAnalysis *analysis = core->analysis;
+	RzBinObject *bo = NULL;
 	RzBinSymbol *symbol = NULL;
 	RzListIter *it = NULL;
 	ShareBin message = { 0 };
-	RzAnalysis *analysis = core->analysis;
-	RzBinObject *bo = NULL;
+	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
 
 	if (!(bo = rz_bin_cur_object(core->bin)) ||
 		!sil_has_symbols(core->analysis, bo)) {
@@ -648,8 +674,9 @@ static bool sil_send_share_bin(sil_t *sil, RzCore *core) {
 				ht_pp_insert(ht, section, sharesec);
 				proto_share_bin_share_section_add(&message, sharesec);
 			}
-
-			proto_share_section_hint_add(sharesec, func->addr, func->bits);
+			// The offset must be the relative function address from the base address of the section
+			ut64 offset = func->addr - (is_va ? section->vaddr : section->paddr);
+			proto_share_section_hint_add(sharesec, offset, func->bits);
 		}
 
 		if (!sil->can_share_symbols) {

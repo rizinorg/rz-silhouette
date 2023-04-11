@@ -13,7 +13,7 @@ char *sil_to_lower_dup(const char *original, const char *def_string);
 
 /* Protobuf helpers */
 void proto_section_hash_free(SectionHash *message);
-SectionHash *proto_section_hash_new(ut32 size, ut8 *digest, size_t digest_size);
+SectionHash *proto_section_hash_new(ut32 size, ut64 paddr, ut8 *digest, size_t digest_size);
 
 void proto_share_section_free(ShareSection *message);
 ShareSection *proto_share_section_new(const char *name, SectionHash *section, size_t reserve_hints);
