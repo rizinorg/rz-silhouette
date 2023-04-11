@@ -318,6 +318,10 @@ static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *f
 		return;
 	}
 
+	RzBinSymbol *last = rz_list_last(bf->o->symbols);
+	if (last) {
+		symbol->ordinal = last->ordinal + 1;
+	}
 	symbol->size = size;
 	symbol->bind = RZ_BIN_BIND_GLOBAL_STR;
 	symbol->type = RZ_BIN_TYPE_FUNC_STR;
