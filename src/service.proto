@@ -40,8 +40,9 @@ message Symbol {
 /* client messages used to request info to the server */
 
 message SectionHash {
-  uint32 size = 1; // binary section size
-  bytes digest = 2; // binary section digest
+  uint32 size = 1; // binary section physical size
+  uint64 paddr = 2; // binary section physical address
+  bytes digest = 3; // binary section digest
 }
 
 message Binary {

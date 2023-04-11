@@ -98,9 +98,13 @@ struct  SectionHash
 {
   ProtobufCMessage base;
   /*
-   * binary section size
+   * binary section physical size
    */
   uint32_t size;
+  /*
+   * binary section physical address
+   */
+  uint64_t paddr;
   /*
    * binary section digest
    */
@@ -108,7 +112,7 @@ struct  SectionHash
 };
 #define SECTION_HASH__INIT \
  { PROTOBUF_C_MESSAGE_INIT (&section_hash__descriptor) \
-    , 0, {0,NULL} }
+    , 0, 0, {0,NULL} }
 
 
 struct  Binary
