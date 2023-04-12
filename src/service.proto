@@ -54,7 +54,7 @@ message Binary {
 message Signature {
   string arch = 1; // architecture name
   uint32 bits = 2; // architecture bits
-  uint32 length = 3; // function length
+  uint32 length = 3; // function digest length
   bytes digest = 4; // function digest of the masked bytes
 }
 
