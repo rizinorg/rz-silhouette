@@ -28,3 +28,7 @@ To test if the credentials are correct, you can open rizin and execute the follo
 Hello World from the server!
 response delay: 2.5ms
 ```
+
+## Documentation
+
+Documentation is available [here](https://github.com/rizinorg/rz-silhouette/tree/main/docs)
