@@ -318,14 +318,14 @@ static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *f
 		return;
 	}
 
-	RzBinSymbol *last = rz_list_last(bf->o->symbols);
+	RzBinSymbol *last = (RzBinSymbol *)rz_pvector_tail(bf->o->symbols);
 	if (last) {
 		symbol->ordinal = last->ordinal + 1;
 	}
 	symbol->size = size;
 	symbol->bind = RZ_BIN_BIND_GLOBAL_STR;
 	symbol->type = RZ_BIN_TYPE_FUNC_STR;
-	if (!rz_list_append(bf->o->symbols, symbol)) {
+	if (!rz_pvector_push(bf->o->symbols, symbol)) {
 		RZ_LOG_ERROR("Failed append new go symbol to symbols list\n");
 		rz_bin_symbol_free(symbol);
 	}
@@ -355,7 +355,7 @@ static void sil_apply_symbol(RzCore *core, RzAnalysisFunction *fcn, Symbol *symb
 
 	// apply function signature
 	if (!RZ_STR_ISEMPTY(symbol->signature)) {
-		// strip any `sym.` and remove `.` from the signature. 
+		// strip any `sym.` and remove `.` from the signature.
 		symbol->signature = rz_str_replace(symbol->signature, "sym.", "", 0);
 		rz_str_replace_ch(symbol->signature, '.', '_', 1);
 		if (!rz_analysis_function_set_type_str(core->analysis, fcn, symbol->signature)) {
@@ -580,9 +580,10 @@ static int rz_section_cmp(const void *a, const void *b) {
 }
 
 static bool sil_has_symbols(RzAnalysis *analysis, RzBinObject *bo) {
-	RzListIter *it;
+	void **it;
 	RzBinSymbol *symbol = NULL;
-	rz_list_foreach (bo->symbols, it, symbol) {
+	rz_pvector_foreach (bo->symbols, it) {
+		symbol = (RzBinSymbol *)*it;
 		if (!symbol->is_imported &&
 			rz_analysis_get_function_at(analysis, symbol->vaddr)) {
 			return true;
@@ -604,7 +605,7 @@ static bool sil_send_share_bin(sil_t *sil, RzCore *core) {
 	RzAnalysis *analysis = core->analysis;
 	RzBinObject *bo = NULL;
 	RzBinSymbol *symbol = NULL;
-	RzListIter *it = NULL;
+	void **it = NULL;
 	ShareBin message = { 0 };
 	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
 
@@ -629,7 +630,7 @@ static bool sil_send_share_bin(sil_t *sil, RzCore *core) {
 	size_t max_size = rz_config_get_i(core->config, RZ_SIL_PATTERN_SIZE);
 
 	// in the worse case scenario we will have as many sections as symbols
-	size_t max_symbols = rz_list_length(bo->symbols);
+	size_t max_symbols = rz_pvector_len(bo->symbols);
 
 	if (!proto_share_bin_init(&message, bin_type, bin_os, max_symbols, max_symbols)) {
 		return false;
@@ -643,7 +644,8 @@ static bool sil_send_share_bin(sil_t *sil, RzCore *core) {
 		goto fail;
 	}
 
-	rz_list_foreach (bo->symbols, it, symbol) {
+	rz_pvector_foreach (bo->symbols, it) {
+		symbol = (RzBinSymbol *)*it;
 		if (symbol->is_imported) {
 			continue;
 		}
