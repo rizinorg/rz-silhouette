@@ -464,10 +464,9 @@ static SectionHash *sil_section_digest(RzCore *core, RzBinSection *bsect, const 
 static bool sil_request_and_apply_hints(sil_t *sil, RzCore *core, sil_stats_t *stats) {
 	bool result = true;
 	const RzHashPlugin *blake = NULL;
-	const RzList *list = NULL;
+	const RzPVector *sections = NULL;
 	RzBinObject *bo = NULL;
 	RzBinSection *bsect = NULL;
-	RzListIter *it = NULL;
 	Binary *binary = NULL;
 
 	blake = rz_hash_plugin_by_name(core->hash, "blake3");
@@ -482,14 +481,16 @@ static bool sil_request_and_apply_hints(sil_t *sil, RzCore *core, sil_stats_t *s
 		return false;
 	}
 
-	list = rz_bin_object_get_sections_all(bo);
+	sections = rz_bin_object_get_sections_all(bo);
 
 	const char *type = bo->plugin ? bo->plugin->name : NULL;
 	const char *os = bo->info ? bo->info->os : NULL;
 
-	binary = proto_binary_new(type, os, rz_list_length(list));
+	binary = proto_binary_new(type, os, rz_pvector_len(sections));
 
-	rz_list_foreach (list, it, bsect) {
+	void **it;
+	rz_pvector_foreach (sections, it) {
+		bsect = (RzBinSection *)*it;
 		if (!(bsect->perm & RZ_PERM_X)) {
 			continue;
 		}
