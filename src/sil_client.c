@@ -55,7 +55,6 @@ static void sil_signature_free(sil_signature_t *signature) {
 	free(signature);
 }
 
-#define sil_signature_empty_new(function) sil_signature_new(function, NULL)
 static sil_signature_t *sil_signature_new(RzAnalysisFunction *function, Signature *message) {
 	sil_signature_t *signature = RZ_NEW0(sil_signature_t);
 	if (!signature) {
@@ -759,10 +758,9 @@ static void *sil_calculate_signature_thread(sil_thread_t *context) {
 		}
 	}
 
-	// always push an empty signature to inform main thread to stop.
-	sig = sil_signature_empty_new(func);
-	rz_th_queue_push(sigs, sig, true);
 	free(fcn_prefix);
+	// we wait till all the signatures has been consumed and close the queue
+	rz_th_queue_close_when_empty(sigs);
 	return NULL;
 }
 
@@ -791,10 +789,10 @@ bool sil_resolve_functions(sil_t *sil, RzCore *core, sil_stats_t *stats) {
 	size_t n_functions = 0;
 	RzThreadQueue *sigs = NULL;
 	RzThread *th = NULL;
+	void *data = NULL;
 	sil_thread_t th_info = { 0 };
 	RzAnalysis *analysis = core->analysis;
-	sil_signature_t *signature = NULL;
-
+	
 	memset(stats, 0, sizeof(sil_stats_t));
 
 	n_functions = rz_list_length(analysis->fcns);
@@ -838,8 +836,9 @@ bool sil_resolve_functions(sil_t *sil, RzCore *core, sil_stats_t *stats) {
 	}
 
 	result = true;
-	while ((signature = rz_th_queue_wait_pop(sigs, false))) {
-		if (!signature->message) {
+	while (rz_th_queue_pop(sigs, false, &data)) {
+		sil_signature_t *signature = (sil_signature_t *)data;
+		if (!signature || !signature->message) {
 			sil_signature_free(signature);
 			break;
 		}
