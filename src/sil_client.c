@@ -447,7 +447,7 @@ static SectionHash *sil_section_digest(RzCore *core, RzBinSection *bsect, const 
 		return NULL;
 	}
 
-	rz_io_read_at(core->io, address, data, bsect->size);
+	rz_io_read_at_mapped(core->io, address, data, bsect->size);
 
 	blake->small_block(data, bsect->size, &dgst, &size);
 	free(data);
