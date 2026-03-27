@@ -7,9 +7,11 @@
 
 #define RZ_IO_VA               "io.va"
 #define RZ_ASM_ARCH            "asm.arch"
+#define RZ_ASM_BITS            "asm.bits"
 #define RZ_ANALYSIS_FCN_PREFIX "analysis.fcnprefix"
 
-#define RZ_SIL_VERSION (1)
+#define RZ_SIL_VERSION_PROTOBUF (1)
+#define RZ_SIL_VERSION_CAPNP    (2)
 
 #define RZ_SIL_ENABLE         "silhouette.enable"
 #define RZ_SIL_ENABLE_DEFAULT false
@@ -53,6 +55,22 @@
 
 #define RZ_SIL_SRV_TEXT         "silhouette.server.message"
 #define RZ_SIL_SRV_TEXT_DEFAULT true
-#define RZ_SIL_SRV_TEXT_DESCR   "When set to true shows any message received by the silhouette server."
+#define RZ_SIL_SRV_TEXT_DESCR   "When set to true shows any message or server info received by the silhouette server."
+
+#define RZ_SIL_CODEC         "silhouette.codec"
+#define RZ_SIL_CODEC_DEFAULT "auto"
+#define RZ_SIL_CODEC_DESCR   "Selects the transport codec: auto, protobuf or capnp."
+
+#define RZ_SIL_KEENHASH         "silhouette.keenhash"
+#define RZ_SIL_KEENHASH_DEFAULT true
+#define RZ_SIL_KEENHASH_DESCR   "When set to true sends the pseudocode bundle for KEENHash-assisted lookup when available."
+
+#define RZ_SIL_KEENHASH_TOPK         "silhouette.keenhash.topk"
+#define RZ_SIL_KEENHASH_TOPK_DEFAULT 10
+#define RZ_SIL_KEENHASH_TOPK_DESCR   "Maximum number of ML candidate binaries to request."
+
+#define RZ_SIL_DECOMPILER         "silhouette.decompiler"
+#define RZ_SIL_DECOMPILER_DEFAULT "rz-ghidra"
+#define RZ_SIL_DECOMPILER_DESCR   "Decompiler backend to use for the pseudocode bundle, or 'off'."
 
 #endif /* SIL_CONST_H */

@@ -19,7 +19,14 @@ e silhouette.host=<server>
 e silhouette.port=<port>
 # available only if rizin was built with openssl
 e silhouette.tls=true
+e silhouette.codec=auto
+e silhouette.keenhash=true
+e silhouette.keenhash.topk=10
+e silhouette.decompiler=rz-ghidra
 ```
+
+`silhouette.codec=auto` prefers Cap'n Proto v2 and falls back to protobuf when needed.
+`silhouette.decompiler=off` disables the pseudocode bundle and keeps exact matching only.
 
 To test if the credentials are correct, you can open rizin and execute the following command.
 ```

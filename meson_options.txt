@@ -1,2 +1,4 @@
 option('rizin_plugdir', type: 'string', value: '', description: 'rizin plugin install directory')
+option('rizin_root', type: 'string', value: '', description: 'Fallback installation prefix for Rizin headers and libraries when rz_core metadata is unavailable')
 option('use_sys_protobuf_c', type: 'feature', value: 'disabled')
+option('use_sys_capnp_c', type: 'feature', value: 'auto')

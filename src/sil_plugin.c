@@ -61,12 +61,16 @@ static sil_t *sil_plugin_create(RzCore *core) {
 		.can_share = rz_config_get_b(core->config, RZ_SIL_SHARE),
 		.can_share_sections = rz_config_get_b(core->config, RZ_SIL_SHARE_SECTIONS),
 		.can_share_symbols = rz_config_get_b(core->config, RZ_SIL_SHARE_SYMBOLS),
+		.codec = rz_config_get(core->config, RZ_SIL_CODEC),
+		.keenhash = rz_config_get_b(core->config, RZ_SIL_KEENHASH),
+		.keenhash_topk = rz_config_get_i(core->config, RZ_SIL_KEENHASH_TOPK),
+		.decompiler = rz_config_get(core->config, RZ_SIL_DECOMPILER),
 	};
 	return sil_new(&opts);
 }
 
 RZ_IPI RzCmdStatus sil_command_handler(RzCore *core, int argc, const char **argv) {
-	if (argc < 1) {
+	if (argc < 2) {
 		return RZ_CMD_STATUS_ERROR;
 	}
 
@@ -77,12 +81,10 @@ RZ_IPI RzCmdStatus sil_command_handler(RzCore *core, int argc, const char **argv
 	}
 
 	if (!strcmp(argv[1], "test")) {
-		ut64 start_usec = rz_time_now();
-		result = sil_test_connection(sil);
-		ut64 end_usec = rz_time_now();
+		ut64 elapsed_usec = 0;
+		result = sil_test_connection(sil, &elapsed_usec);
 		if (result) {
-			float delay = end_usec - start_usec;
-			delay /= 1000.f;
+			double delay = (double)elapsed_usec / 1000.0;
 			rz_cons_printf("response delay: %.1fms\n", delay);
 		}
 	} else if (!strcmp(argv[1], "share")) {
@@ -130,6 +132,10 @@ static void sil_setup_evars(RzConfig *cfg) {
 	SETPREFB(RZ_SIL_SHARE, RZ_SIL_SHARE_DEFAULT, RZ_SIL_SHARE_DESCR);
 	SETPREFB(RZ_SIL_SHARE_SECTIONS, RZ_SIL_SHARE_SECTIONS_DEFAULT, RZ_SIL_SHARE_SECTIONS_DESCR);
 	SETPREFB(RZ_SIL_SHARE_SYMBOLS, RZ_SIL_SHARE_SYMBOLS_DEFAULT, RZ_SIL_SHARE_SYMBOLS_DESCR);
+	SETPREFS(RZ_SIL_CODEC, RZ_SIL_CODEC_DEFAULT, RZ_SIL_CODEC_DESCR);
+	SETPREFB(RZ_SIL_KEENHASH, RZ_SIL_KEENHASH_DEFAULT, RZ_SIL_KEENHASH_DESCR);
+	SETPREFI(RZ_SIL_KEENHASH_TOPK, RZ_SIL_KEENHASH_TOPK_DEFAULT, RZ_SIL_KEENHASH_TOPK_DESCR);
+	SETPREFS(RZ_SIL_DECOMPILER, RZ_SIL_DECOMPILER_DEFAULT, RZ_SIL_DECOMPILER_DESCR);
 	rz_config_lock(cfg, true);
 }
 

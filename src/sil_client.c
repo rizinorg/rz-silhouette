@@ -12,25 +12,35 @@
 #include "sil.h"
 #include "sil_helpers.h"
 #include "sil_protocol.h"
+#include <rz_util/rz_json.h>
 
 #define SIL_RETRY_TIMES (3)
+#define SIL_PSEUDOCODE_MAX_FUNCTION_BYTES 2048U
+#define SIL_PSEUDOCODE_MAX_TOTAL_BYTES (1024U * 1024U)
+#define SIL_PSEUDOCODE_FALLBACK_FUNCTION_BYTES 512U
+#define SIL_PSEUDOCODE_FALLBACK_TOTAL_BYTES (128U * 1024U)
+#define SIL_PSEUDOCODE_MIN_REMAINING_BYTES 128U
+#define SIL_MATERIALIZE_MAX_BB_SIZE 256U
+#define SIL_MATERIALIZE_FALLBACK_BB_SIZE 16U
+#define SIL_MATERIALIZE_MAX_OPS 32U
 
 typedef struct sil_s {
 	char *psk;
 	char *address;
 	char *port;
+	char *decompiler;
 	ut32 timeout;
+	ut32 keenhash_topk;
+	sil_codec_mode_t codec;
 	bool use_tls;
 	bool show_msg;
 	bool can_share;
 	bool can_share_sections;
 	bool can_share_symbols;
+	bool keenhash;
+	bool ghidra_probe_done;
+	bool ghidra_available;
 } sil_t;
-
-typedef struct {
-	const RzHashPlugin *blake;
-	void *md;
-} sil_hash_ctx_t;
 
 typedef struct {
 	Signature *message;
@@ -43,9 +53,13 @@ typedef struct {
 	const RzHashPlugin *blake;
 	const char *fcn_prefix;
 	const char *arch_name;
+	sil_signature_t *end_marker;
 	size_t max_size;
 	bool stop;
 } sil_thread_t;
+
+static SectionHash *sil_section_digest(RzCore *core, RzBinSection *bsect, const RzHashPlugin *blake);
+static Signature *sil_function_to_signature(RzAnalysis *analysis, RzAnalysisFunction *fcn, const char *arch, const RzHashPlugin *blake, size_t max_pattern);
 
 static void sil_signature_free(sil_signature_t *signature) {
 	if (!signature) {
@@ -72,7 +86,196 @@ void sil_free(sil_t *sil) {
 	free(sil->psk);
 	free(sil->address);
 	free(sil->port);
+	free(sil->decompiler);
 	free(sil);
+}
+
+static sil_codec_mode_t sil_codec_parse(const char *value) {
+	if (RZ_STR_ISEMPTY(value) || !strcmp(value, "auto")) {
+		return SIL_CODEC_AUTO;
+	}
+	if (!strcmp(value, "protobuf")) {
+		return SIL_CODEC_PROTOBUF;
+	}
+	if (!strcmp(value, "capnp")) {
+		return SIL_CODEC_CAPNP;
+	}
+	RZ_LOG_WARN("silhouette: unknown codec '%s', falling back to auto.\n", value);
+	return SIL_CODEC_AUTO;
+}
+
+static bool sil_prefers_capnp(const sil_t *sil) {
+	return sil && sil->codec != SIL_CODEC_PROTOBUF;
+}
+
+static bool sil_can_fallback_to_protobuf(const sil_t *sil) {
+	return sil && sil->codec == SIL_CODEC_AUTO;
+}
+
+static bool sil_decompiler_enabled(const sil_t *sil) {
+	return sil && sil->keenhash && strcmp(sil->decompiler, "off");
+}
+
+static bool sil_has_command(RzCore *core, const char *name) {
+	if (!core || !core->rcmd || RZ_STR_ISEMPTY(name)) {
+		return false;
+	}
+	return rz_cmd_get_desc(core->rcmd, name) != NULL;
+}
+
+static bool sil_is_bb_terminator(const RzAnalysisOp *op) {
+	if (!op) {
+		return true;
+	}
+	ut32 type = op->type & RZ_ANALYSIS_OP_TYPE_MASK;
+	if (op->type & RZ_ANALYSIS_OP_TYPE_TAIL) {
+		return true;
+	}
+	switch (type) {
+	case RZ_ANALYSIS_OP_TYPE_JMP:
+	case RZ_ANALYSIS_OP_TYPE_UJMP:
+	case RZ_ANALYSIS_OP_TYPE_CJMP:
+	case RZ_ANALYSIS_OP_TYPE_RET:
+	case RZ_ANALYSIS_OP_TYPE_CRET:
+	case RZ_ANALYSIS_OP_TYPE_TRAP:
+	case RZ_ANALYSIS_OP_TYPE_ILL:
+	case RZ_ANALYSIS_OP_TYPE_SWI:
+	case RZ_ANALYSIS_OP_TYPE_CSWI:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static RzBinSymbol *sil_find_bin_symbol(RzBinFile *bf, const char *name, ut64 vaddr) {
+	if (!bf || !bf->o || !bf->o->symbols || RZ_STR_ISEMPTY(name)) {
+		return NULL;
+	}
+	void **it = NULL;
+	rz_pvector_foreach (bf->o->symbols, it) {
+		RzBinSymbol *symbol = (RzBinSymbol *)*it;
+		if (!symbol || symbol->vaddr != vaddr || RZ_STR_ISEMPTY(symbol->name)) {
+			continue;
+		}
+		if (!strcmp(symbol->name, name)) {
+			return symbol;
+		}
+	}
+	return NULL;
+}
+
+static void sil_upsert_bin_symbol(RzCore *core, const char *name, ut64 addr, ut64 size) {
+	RzBinFile *bf = rz_bin_cur(core->bin);
+	if (!bf || !bf->o || !bf->o->symbols || RZ_STR_ISEMPTY(name)) {
+		return;
+	}
+
+	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
+	size_t offset = !strncmp(name, "sym.", strlen("sym.")) ? strlen("sym.") : 0;
+	ut64 paddr = is_va ? rz_bin_object_v2p(bf->o, addr) : addr;
+	RzBinSymbol *existing = sil_find_bin_symbol(bf, name + offset, addr);
+	if (existing) {
+		existing->size = size;
+		return;
+	}
+
+	RzBinSymbol *symbol = rz_bin_symbol_new(name + offset, paddr, addr);
+	if (!symbol) {
+		RZ_LOG_ERROR("silhouette: failed to allocate bin symbol for '%s'\n", name);
+		return;
+	}
+
+	RzBinSymbol *last = (RzBinSymbol *)rz_pvector_tail(bf->o->symbols);
+	if (last) {
+		symbol->ordinal = last->ordinal + 1;
+	}
+	symbol->size = size;
+	symbol->bind = RZ_BIN_BIND_GLOBAL_STR;
+	symbol->type = RZ_BIN_TYPE_FUNC_STR;
+	if (!rz_pvector_push(bf->o->symbols, symbol)) {
+		rz_bin_symbol_free(symbol);
+	}
+}
+
+static ut32 sil_estimate_materialized_bb_size(RzCore *core, ut64 address, ut32 suggested_size, ut64 *jump, ut64 *fail) {
+	ut64 limit = suggested_size > 0 ? suggested_size : SIL_MATERIALIZE_MAX_BB_SIZE;
+	limit = RZ_MIN(limit, (ut64)SIL_MATERIALIZE_MAX_BB_SIZE);
+	ut32 total = 0;
+
+	if (jump) {
+		*jump = UT64_MAX;
+	}
+	if (fail) {
+		*fail = UT64_MAX;
+	}
+
+	for (ut32 i = 0; i < SIL_MATERIALIZE_MAX_OPS && total < limit; i++) {
+		ut64 current = address + total;
+		if (total > 0) {
+			RzAnalysisFunction *next_func = rz_analysis_get_function_at(core->analysis, current);
+			if ((next_func && next_func->addr == current) || rz_flag_get_i(core->flags, current)) {
+				break;
+			}
+		}
+
+		RzAnalysisOp *op = rz_core_op_analysis(core, current, RZ_ANALYSIS_OP_MASK_BASIC | RZ_ANALYSIS_OP_MASK_HINT);
+		if (!op || op->size < 1) {
+			rz_analysis_op_free(op);
+			break;
+		}
+
+		ut32 next_total = total + (ut32)op->size;
+		if (next_total > limit && total > 0) {
+			rz_analysis_op_free(op);
+			break;
+		}
+		total = next_total;
+		if (jump && op->jump != UT64_MAX) {
+			*jump = op->jump;
+		}
+		if (fail && op->fail != UT64_MAX) {
+			*fail = op->fail;
+		}
+		bool stop = sil_is_bb_terminator(op);
+		rz_analysis_op_free(op);
+		if (stop) {
+			break;
+		}
+	}
+
+	if (total < 1) {
+		total = suggested_size > 0 ? suggested_size : SIL_MATERIALIZE_FALLBACK_BB_SIZE;
+		total = RZ_MIN(total, (ut32)SIL_MATERIALIZE_MAX_BB_SIZE);
+	}
+	return total;
+}
+
+static bool sil_ghidra_available(sil_t *sil, RzCore *core) {
+	if (!sil || !core) {
+		return false;
+	}
+	if (!sil->ghidra_probe_done) {
+		sil->ghidra_available = sil_has_command(core, "pdg") || sil_has_command(core, "pdgj");
+		sil->ghidra_probe_done = true;
+	}
+	return sil->ghidra_available;
+}
+
+static char *sil_strdup_n(const char *text, size_t len) {
+	char *copy = malloc(len + 1);
+	if (!copy) {
+		return NULL;
+	}
+	memcpy(copy, text, len);
+	copy[len] = '\0';
+	return copy;
+}
+
+static ut32 sil_timeout_to_socket_seconds(ut32 timeout_ms) {
+	if (!timeout_ms) {
+		return 0;
+	}
+	return (timeout_ms + 999) / 1000;
 }
 
 sil_t *sil_new(sil_opt_t *opts) {
@@ -86,12 +289,16 @@ sil_t *sil_new(sil_opt_t *opts) {
 	sil->psk = strdup(opts->psk);
 	sil->address = strdup(opts->address);
 	sil->port = strdup(opts->port);
+	sil->decompiler = strdup(RZ_STR_ISEMPTY(opts->decompiler) ? "off" : opts->decompiler);
 	sil->timeout = opts->timeout;
+	sil->codec = sil_codec_parse(opts->codec);
+	sil->keenhash_topk = opts->keenhash_topk;
 	sil->use_tls = opts->use_tls;
 	sil->show_msg = opts->show_msg;
 	sil->can_share = opts->can_share;
 	sil->can_share_sections = opts->can_share_sections;
 	sil->can_share_symbols = opts->can_share_symbols;
+	sil->keenhash = opts->keenhash;
 
 	if (RZ_STR_ISEMPTY(sil->address)) {
 		RZ_LOG_ERROR("silhouette: failed to allocate memory or empty string (address)\n");
@@ -101,6 +308,9 @@ sil_t *sil_new(sil_opt_t *opts) {
 		goto fail;
 	} else if (RZ_STR_ISEMPTY(sil->psk)) {
 		RZ_LOG_ERROR("silhouette: failed to allocate memory or empty string (psk)\n");
+		goto fail;
+	} else if (!sil->decompiler) {
+		RZ_LOG_ERROR("silhouette: failed to allocate memory (decompiler)\n");
 		goto fail;
 	}
 
@@ -118,7 +328,7 @@ static RzSocket *sil_socket_new(sil_t *sil) {
 		return NULL;
 	}
 
-	if (!rz_socket_connect_tcp(socket, sil->address, sil->port, sil->timeout)) {
+	if (!rz_socket_connect_tcp(socket, sil->address, sil->port, sil_timeout_to_socket_seconds(sil->timeout))) {
 		RZ_LOG_ERROR("silhouette: failed to connect to %s at port %s (%s)\n", sil->address, sil->port, sil->use_tls ? "secure" : "insecure");
 		rz_socket_free(socket);
 		return NULL;
@@ -146,17 +356,76 @@ static bool sil_handle_fail_status(Status status) {
 	}
 }
 
+static bool sil_handle_fail_status_v2(enum StatusV2 status, const sil_v2_response_t *response) {
+	const char *message = response && response->which == ResponseV2_message ? response->text : NULL;
+	switch (status) {
+	case StatusV2_internalError:
+		RZ_LOG_ERROR("silhouette: internal server error%s%s.\n", message ? ": " : "", message ? message : "");
+		return false;
+	case StatusV2_clientBadPreSharedKey:
+		RZ_LOG_ERROR("silhouette: server did not accept the current psk%s%s.\n", message ? ": " : "", message ? message : "");
+		return false;
+	case StatusV2_clientNotAuthorized:
+		RZ_LOG_ERROR("silhouette: client was not authorized%s%s.\n", message ? ": " : "", message ? message : "");
+		return false;
+	case StatusV2_versionMismatch:
+		RZ_LOG_ERROR("silhouette: the installed plugin is too old%s%s.\n", message ? ": " : "", message ? message : "");
+		return false;
+	default:
+		RZ_LOG_ERROR("silhouette: could not understand the capnp response from the server %u.\n", status);
+		return false;
+	}
+}
+
+static bool sil_v2_can_fallback_silently(const sil_t *sil, enum StatusV2 status, const sil_v2_response_t *response) {
+	const char *message = response && response->which == ResponseV2_message ? response->text : NULL;
+	if (!sil_can_fallback_to_protobuf(sil)) {
+		return false;
+	}
+	if (status == StatusV2_versionMismatch) {
+		return true;
+	}
+	return status == StatusV2_clientNotAuthorized &&
+		RZ_STR_ISNOTEMPTY(message) &&
+		strstr(message, "capnp v2 requires TLS");
+}
+
+static void sil_show_server_info(const sil_t *sil, const sil_server_info_t *info) {
+	if (!sil || !sil->show_msg || !info) {
+		return;
+	}
+	rz_cons_printf("silhouette server: protocol %u-%u, keenhash=%s, tls=%s, model=%s, index=%s\n",
+		info->min_version,
+		info->max_version,
+		info->keenhash_enabled ? "on" : "off",
+		info->tls_required ? "required" : "optional",
+		RZ_STR_ISNOTEMPTY(info->model_version) ? info->model_version : "-",
+		RZ_STR_ISNOTEMPTY(info->index_version) ? info->index_version : "-");
+	rz_cons_flush();
+}
+
+static void sil_measure_latency_add(ut64 *elapsed_usec, ut64 started_usec) {
+	if (elapsed_usec) {
+		*elapsed_usec += rz_time_now() - started_usec;
+	}
+}
+
 #define sil_retry_n_times(n_times, send, recv, fail) \
-	for (int i = 0; i < (n_times + 1); ++i) { \
-		if (i > n_times) { \
+	do { \
+		bool sil_retry_ok = false; \
+		for (int sil_retry_i = 0; sil_retry_i <= (n_times); ++sil_retry_i) { \
+			(send); \
+			if (recv) { \
+				sil_retry_ok = true; \
+				break; \
+			} \
+		} \
+		if (!sil_retry_ok) { \
 			fail \
 		} \
-		if (send && recv) { \
-			break; \
-		} \
-	}
+	} while (0)
 
-static bool sil_ping_handle(sil_t *sil) {
+static bool sil_ping_handle_v1(sil_t *sil, ut64 *elapsed_usec) {
 	bool result = true;
 	Message *message = NULL;
 	Status status = STATUS__INTERNAL_ERROR;
@@ -165,16 +434,19 @@ static bool sil_ping_handle(sil_t *sil) {
 		return false;
 	}
 
+	ut64 started_usec = rz_time_now();
 	sil_retry_n_times(SIL_RETRY_TIMES,
 		sil_protocol_ping_send(socket, sil->psk),
 		sil_protocol_response_recv(socket, &status, (void **)&message),
 		{
+			sil_measure_latency_add(elapsed_usec, started_usec);
 			result = false;
 			goto fail;
 		});
+	sil_measure_latency_add(elapsed_usec, started_usec);
 
 	if (status != STATUS__MESSAGE) {
-		sil_handle_fail_status(status);
+		result = sil_handle_fail_status(status);
 	} else if (message && sil->show_msg &&
 		!RZ_STR_ISEMPTY(message->text)) {
 		rz_cons_printf("%s\n", message->text);
@@ -186,6 +458,59 @@ fail:
 	rz_socket_free(socket);
 	message__free_unpacked(message, NULL);
 	return result;
+}
+
+static bool sil_ping_handle_v2(sil_t *sil, ut64 *elapsed_usec) {
+	bool result = true;
+	sil_v2_response_t response = { 0 };
+	RzSocket *socket = sil_socket_new(sil);
+	if (!socket) {
+		return false;
+	}
+
+	ut64 started_usec = rz_time_now();
+	sil_retry_n_times(SIL_RETRY_TIMES,
+		sil_protocol_ping_v2_send(socket, sil->psk),
+		sil_protocol_response_v2_recv(socket, &response),
+		{
+			sil_measure_latency_add(elapsed_usec, started_usec);
+			result = false;
+			goto fail;
+		});
+	sil_measure_latency_add(elapsed_usec, started_usec);
+
+	if (response.status != StatusV2_serverInfo) {
+		if (sil_v2_can_fallback_silently(sil, response.status, &response)) {
+			result = false;
+			goto fail;
+		}
+		result = sil_handle_fail_status_v2(response.status, &response);
+	} else {
+		sil_show_server_info(sil, &response.server_info);
+	}
+
+fail:
+	rz_socket_close(socket);
+	rz_socket_free(socket);
+	sil_capnp_response_fini(&response);
+	return result;
+}
+
+static bool sil_ping_handle(sil_t *sil, ut64 *elapsed_usec) {
+	if (elapsed_usec) {
+		*elapsed_usec = 0;
+	}
+	if (!sil_prefers_capnp(sil)) {
+		return sil_ping_handle_v1(sil, elapsed_usec);
+	}
+	if (sil_ping_handle_v2(sil, elapsed_usec)) {
+		return true;
+	}
+	if (sil_can_fallback_to_protobuf(sil)) {
+		RZ_LOG_INFO("silhouette: falling back to protobuf ping.\n");
+		return sil_ping_handle_v1(sil, elapsed_usec);
+	}
+	return false;
 }
 
 static void sil_apply_match_hints(RzCore *core, const MatchHints *matches, sil_stats_t *stats) {
@@ -239,7 +564,7 @@ static bool sil_binary_handle(sil_t *sil, Binary *binary, RzCore *core, sil_stat
 		});
 
 	if (status != STATUS__HINTS) {
-		sil_handle_fail_status(status);
+		result = sil_handle_fail_status(status);
 	} else if (message) {
 		sil_apply_match_hints(core, message, stats);
 	}
@@ -303,31 +628,63 @@ static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *f
 	// set new flag
 	analysis->flb.set(analysis->flb.f, name, fcn->addr, size);
 
-	RzBinFile *bf = rz_bin_cur(core->bin);
-	if (!bf || !bf->o || !bf->o->symbols) {
+	(void)is_va;
+	sil_upsert_bin_symbol(core, name, fcn->addr, size);
+}
+
+static void add_named_flag_at(RzCore *core, const char *name, ut64 addr, ut64 size) {
+	if (!core || RZ_STR_ISEMPTY(name)) {
 		return;
 	}
 
-	size_t offset = !strncmp(name, "sym.", strlen("sym.")) ? strlen("sym.") : 0;
+	core->analysis->flb.set(core->analysis->flb.f, name, addr, size);
 
-	ut64 paddr = is_va ? rz_bin_object_v2p(bf->o, fcn->addr) : fcn->addr;
-	RzBinSymbol *symbol = rz_bin_symbol_new(name + offset, paddr, fcn->addr);
-	if (!symbol) {
-		RZ_LOG_ERROR("Failed allocate new go symbol\n");
-		return;
+	sil_upsert_bin_symbol(core, name, addr, size);
+}
+
+static ut64 sil_offset_to_addr(RzCore *core, ut64 offset) {
+	if (!core || !offset) {
+		return offset;
+	}
+	if (!rz_config_get_b(core->config, RZ_IO_VA)) {
+		return offset;
+	}
+	RzBinObject *bo = rz_bin_cur_object(core->bin);
+	return bo ? rz_bin_object_p2v(bo, offset) : offset;
+}
+
+static RzAnalysisFunction *sil_materialize_function(RzCore *core, ut64 address, ut32 size) {
+	RzAnalysisFunction *func = rz_analysis_get_function_at(core->analysis, address);
+	if (func && func->addr == address) {
+		return func;
 	}
 
-	RzBinSymbol *last = (RzBinSymbol *)rz_pvector_tail(bf->o->symbols);
-	if (last) {
-		symbol->ordinal = last->ordinal + 1;
+	if (!func) {
+		rz_core_analysis_function_add(core, NULL, address, false);
+		func = rz_analysis_get_function_at(core->analysis, address);
+		if (func && func->addr == address) {
+			return func;
+		}
 	}
-	symbol->size = size;
-	symbol->bind = RZ_BIN_BIND_GLOBAL_STR;
-	symbol->type = RZ_BIN_TYPE_FUNC_STR;
-	if (!rz_pvector_push(bf->o->symbols, symbol)) {
-		RZ_LOG_ERROR("Failed append new go symbol to symbols list\n");
-		rz_bin_symbol_free(symbol);
+
+	ut64 jump = UT64_MAX;
+	ut64 fail = UT64_MAX;
+	ut32 bb_size = sil_estimate_materialized_bb_size(core, address, size, &jump, &fail);
+	char *tmp_name = rz_str_newf("fcn.sil.%" PFMT64x, address);
+	if (!tmp_name) {
+		return NULL;
 	}
+	rz_core_cmdf(core, "af+ %s @ 0x%" PFMT64x, tmp_name, address);
+	if (jump != UT64_MAX && fail != UT64_MAX) {
+		rz_core_cmdf(core, "afb+ 0x%" PFMT64x " 0x%" PFMT64x " %u 0x%" PFMT64x " 0x%" PFMT64x, address, address, (unsigned int)bb_size, jump, fail);
+	} else if (jump != UT64_MAX) {
+		rz_core_cmdf(core, "afb+ 0x%" PFMT64x " 0x%" PFMT64x " %u 0x%" PFMT64x, address, address, (unsigned int)bb_size, jump);
+	} else {
+		rz_core_cmdf(core, "afb+ 0x%" PFMT64x " 0x%" PFMT64x " %u", address, address, (unsigned int)bb_size);
+	}
+	free(tmp_name);
+	func = rz_analysis_get_function_at(core->analysis, address);
+	return func && func->addr == address ? func : NULL;
 }
 
 static void sil_apply_symbol(RzCore *core, RzAnalysisFunction *fcn, Symbol *symbol, sil_stats_t *stats) {
@@ -377,6 +734,552 @@ fail:
 	free(name);
 }
 
+static bool sil_should_query_function_name(const char *name, const char *prefix) {
+	(void)prefix;
+	if (RZ_STR_ISEMPTY(name)) {
+		return false;
+	}
+	return strncmp(name, "sym.imp.", strlen("sym.imp."));
+}
+
+static ut32 sil_count_lines(const char *text) {
+	if (RZ_STR_ISEMPTY(text)) {
+		return 0;
+	}
+	ut32 lines = 1;
+	for (const char *ptr = text; *ptr; ptr++) {
+		if (*ptr == '\n') {
+			lines++;
+		}
+	}
+	return lines;
+}
+
+static ut32 sil_count_statements(const char *text) {
+	if (RZ_STR_ISEMPTY(text)) {
+		return 0;
+	}
+	ut32 statements = 0;
+	for (const char *ptr = text; *ptr; ptr++) {
+		if (*ptr == ';') {
+			statements++;
+		}
+	}
+	return statements;
+}
+
+static char *sil_normalize_pseudocode_text(char *text, ut32 *loc, ut32 *nos) {
+	if (!text) {
+		return NULL;
+	}
+	rz_str_trim(text);
+	if (RZ_STR_ISEMPTY(text)) {
+		free(text);
+		return NULL;
+	}
+	if (loc) {
+		*loc = sil_count_lines(text);
+	}
+	if (nos) {
+		*nos = sil_count_statements(text);
+	}
+	return text;
+}
+
+static char *sil_extract_ghidra_pseudocode(RzCore *core, RzAnalysisFunction *func, ut32 *loc, ut32 *nos) {
+	char *json = rz_core_cmd_strf(core, "pdgj @ 0x%" PFMT64x, func->addr);
+	if (!json || (*json != '{' && *json != '[')) {
+		free(json);
+		return NULL;
+	}
+
+	RzJson *root = rz_json_parse(json);
+	if (!root) {
+		free(json);
+		return NULL;
+	}
+
+	const RzJson *node = root;
+	if (root->type == RZ_JSON_ARRAY) {
+		node = rz_json_item(root, 0);
+	}
+
+	const RzJson *code = node ? rz_json_get(node, "code") : NULL;
+	if (!code) {
+		code = node ? rz_json_get(node, "pseudocode") : NULL;
+	}
+	if (!code || code->type != RZ_JSON_STRING || RZ_STR_ISEMPTY(code->str_value)) {
+		rz_json_free(root);
+		free(json);
+		return NULL;
+	}
+
+	char *text = strdup(code->str_value);
+	rz_json_free(root);
+	free(json);
+	return sil_normalize_pseudocode_text(text, loc, nos);
+}
+
+static char *sil_extract_asm_pseudo(RzCore *core, RzAnalysisFunction *func, ut32 *loc, ut32 *nos) {
+	if (!core || !func) {
+		return NULL;
+	}
+
+	bool old_pseudo = rz_config_get_b(core->config, "asm.pseudo");
+	char *json = NULL;
+	RzJson *root = NULL;
+	RzStrBuf *buf = NULL;
+	char *text = NULL;
+	rz_config_set_b(core->config, "asm.pseudo", true);
+	json = rz_core_cmd_strf(core, "pdfj @ 0x%" PFMT64x, func->addr);
+	rz_config_set_b(core->config, "asm.pseudo", old_pseudo);
+	if (!json || *json != '{') {
+		free(json);
+		return NULL;
+	}
+
+	root = rz_json_parse(json);
+	if (!root || root->type != RZ_JSON_OBJECT) {
+		rz_json_free(root);
+		free(json);
+		return NULL;
+	}
+
+	const RzJson *ops = rz_json_get(root, "ops");
+	if (!ops || ops->type != RZ_JSON_ARRAY) {
+		rz_json_free(root);
+		free(json);
+		return NULL;
+	}
+
+	buf = rz_strbuf_new("");
+	if (!buf) {
+		rz_json_free(root);
+		free(json);
+		return NULL;
+	}
+
+	for (size_t i = 0;; i++) {
+		const RzJson *item = rz_json_item(ops, i);
+		if (!item) {
+			break;
+		}
+		const RzJson *opcode = item ? rz_json_get(item, "opcode") : NULL;
+		const RzJson *disasm = item ? rz_json_get(item, "disasm") : NULL;
+		const char *line = NULL;
+		if (opcode && opcode->type == RZ_JSON_STRING && RZ_STR_ISNOTEMPTY(opcode->str_value)) {
+			line = opcode->str_value;
+		} else if (disasm && disasm->type == RZ_JSON_STRING && RZ_STR_ISNOTEMPTY(disasm->str_value)) {
+			line = disasm->str_value;
+		}
+		if (RZ_STR_ISEMPTY(line)) {
+			continue;
+		}
+		rz_strbuf_append(buf, line);
+		rz_strbuf_append(buf, "\n");
+	}
+
+	text = rz_strbuf_drain(buf);
+	rz_json_free(root);
+	free(json);
+	return sil_normalize_pseudocode_text(text, loc, nos);
+}
+
+static char *sil_extract_pseudocode(RzCore *core, sil_t *sil, RzAnalysisFunction *func, ut32 *loc, ut32 *nos, const char **source) {
+	if (source) {
+		*source = "none";
+	}
+	if (!sil_decompiler_enabled(sil) || !core || !func) {
+		return NULL;
+	}
+
+	char *text = NULL;
+	if (!RZ_STR_ISEMPTY(sil->decompiler) && !strcmp(sil->decompiler, "rz-ghidra") && sil_ghidra_available(sil, core)) {
+		text = sil_extract_ghidra_pseudocode(core, func, loc, nos);
+		if (text) {
+			if (source) {
+				*source = "ghidra";
+			}
+			return text;
+		}
+	}
+
+	text = sil_extract_asm_pseudo(core, func, loc, nos);
+	if (text && source) {
+		*source = "pseudo";
+	}
+	return text;
+}
+
+static char *sil_trim_pseudocode_budget(char *text, ut32 *loc, ut32 *nos, size_t *remaining_budget, const char **source) {
+	if (!text) {
+		return NULL;
+	}
+
+	size_t budget = remaining_budget ? *remaining_budget : SIL_PSEUDOCODE_MAX_TOTAL_BYTES;
+	if (budget < SIL_PSEUDOCODE_MIN_REMAINING_BYTES) {
+		free(text);
+		if (loc) {
+			*loc = 0;
+		}
+		if (nos) {
+			*nos = 0;
+		}
+		if (source) {
+			*source = "none";
+		}
+		return NULL;
+	}
+
+	size_t function_limit = (source && *source && !strcmp(*source, "pseudo")) ?
+		(size_t)SIL_PSEUDOCODE_FALLBACK_FUNCTION_BYTES :
+		(size_t)SIL_PSEUDOCODE_MAX_FUNCTION_BYTES;
+	size_t limit = RZ_MIN(function_limit, budget);
+	size_t length = strlen(text);
+	if (length > limit) {
+		char *trimmed = sil_strdup_n(text, limit);
+		free(text);
+		if (!trimmed) {
+			if (source) {
+				*source = "none";
+			}
+			return NULL;
+		}
+		text = sil_normalize_pseudocode_text(trimmed, loc, nos);
+		if (!text) {
+			if (source) {
+				*source = "none";
+			}
+			return NULL;
+		}
+		length = strlen(text);
+	}
+
+	if (remaining_budget) {
+		*remaining_budget = budget > length ? budget - length : 0;
+	}
+	return text;
+}
+
+static size_t sil_initial_pseudocode_budget(RzCore *core, sil_t *sil) {
+	if (!sil_decompiler_enabled(sil)) {
+		return 0;
+	}
+	if (!RZ_STR_ISEMPTY(sil->decompiler) && !strcmp(sil->decompiler, "rz-ghidra") && sil_ghidra_available(sil, core)) {
+		return SIL_PSEUDOCODE_MAX_TOTAL_BYTES;
+	}
+	return SIL_PSEUDOCODE_FALLBACK_TOTAL_BYTES;
+}
+
+static bool sil_program_bundle_alloc(sil_program_bundle_t *bundle, size_t sections, size_t functions) {
+	memset(bundle, 0, sizeof(*bundle));
+	bundle->sections = sections > 0 ? calloc(sizeof(sil_section_v2_t), sections) : NULL;
+	bundle->functions = functions > 0 ? calloc(sizeof(sil_function_v2_t), functions) : NULL;
+	return (sections == 0 || bundle->sections) && (functions == 0 || bundle->functions);
+}
+
+static void sil_copy_section_to_v2(sil_section_v2_t *dst, const RzBinSection *section, SectionHash *hash) {
+	dst->name = section && section->name ? strdup(section->name) : NULL;
+	dst->size = hash ? hash->size : 0;
+	dst->paddr = hash ? hash->paddr : 0;
+	dst->digest_size = hash ? hash->digest.len : 0;
+	if (dst->digest_size > 0) {
+		dst->digest = malloc(dst->digest_size);
+		memcpy(dst->digest, hash->digest.data, dst->digest_size);
+	}
+}
+
+static void sil_copy_signature_to_v2(sil_function_v2_t *dst, Signature *signature) {
+	if (!dst || !signature) {
+		return;
+	}
+	dst->bits = signature->bits;
+	dst->length = signature->length;
+	dst->arch = signature->arch ? strdup(signature->arch) : NULL;
+	dst->digest_size = signature->digest.len;
+	if (dst->digest_size > 0) {
+		dst->digest = malloc(dst->digest_size);
+		memcpy(dst->digest, signature->digest.data, dst->digest_size);
+	}
+}
+
+static bool sil_collect_exec_sections(RzCore *core, sil_program_bundle_t *bundle, const RzHashPlugin *blake) {
+	RzBinObject *bo = rz_bin_cur_object(core->bin);
+	if (!bo) {
+		return false;
+	}
+	const RzPVector *sections = rz_bin_object_get_sections_all(bo);
+	size_t index = 0;
+	void **it;
+	rz_pvector_foreach (sections, it) {
+		RzBinSection *section = (RzBinSection *)*it;
+		if (!(section->perm & RZ_PERM_X)) {
+			continue;
+		}
+		SectionHash *hash = sil_section_digest(core, section, blake);
+		if (!hash) {
+			return false;
+		}
+		sil_copy_section_to_v2(&bundle->sections[index], section, hash);
+		index++;
+		proto_section_hash_free(hash);
+	}
+	bundle->n_sections = index;
+	return true;
+}
+
+static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_program_bundle_t *bundle) {
+	const RzHashPlugin *blake = rz_hash_plugin_by_name(core->hash, "blake3");
+	RzBinObject *bo = rz_bin_cur_object(core->bin);
+	RzAnalysis *analysis = core->analysis;
+	const char *arch = rz_config_get(core->config, RZ_ASM_ARCH);
+	const char *prefix = rz_config_get(core->config, RZ_ANALYSIS_FCN_PREFIX);
+	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
+	size_t max_size = rz_config_get_i(core->config, RZ_SIL_PATTERN_SIZE);
+	size_t pseudocode_budget = sil_initial_pseudocode_budget(core, sil);
+	size_t n_functions = 0;
+	RzListIter *it = NULL;
+	RzAnalysisFunction *func = NULL;
+
+	if (!bo || !analysis || !blake) {
+		return false;
+	}
+	if (RZ_STR_ISEMPTY(prefix)) {
+		prefix = "fcn";
+	}
+
+	rz_list_foreach (analysis->fcns, it, func) {
+		if (sil_should_query_function_name(func->name, prefix)) {
+			n_functions++;
+		}
+	}
+
+	const RzPVector *sections = rz_bin_object_get_sections_all(bo);
+	size_t n_sections = 0;
+	void **vit;
+	rz_pvector_foreach (sections, vit) {
+		RzBinSection *section = (RzBinSection *)*vit;
+		if (section->perm & RZ_PERM_X) {
+			n_sections++;
+		}
+	}
+
+	if (!sil_program_bundle_alloc(bundle, n_sections, n_functions)) {
+		return false;
+	}
+
+	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : strdup("any");
+	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : strdup("any");
+	bundle->arch = sil_to_lower_dup(arch, "any");
+	bundle->bits = rz_config_get_i(core->config, RZ_ASM_BITS);
+	bundle->topk = sil->keenhash_topk;
+
+	if (!sil_collect_exec_sections(core, bundle, blake)) {
+		return false;
+	}
+
+	size_t index = 0;
+	rz_list_foreach (analysis->fcns, it, func) {
+		if (!sil_should_query_function_name(func->name, prefix)) {
+			continue;
+		}
+
+		sil_function_v2_t *dst = &bundle->functions[index];
+		RzBinSection *section = rz_bin_get_section_at(bo, func->addr, rz_config_get_b(core->config, RZ_IO_VA));
+		Signature *signature = sil_function_to_signature(analysis, func, arch, blake, max_size);
+		if (!signature) {
+			continue;
+		}
+
+		dst->addr = func->addr;
+		dst->size = rz_analysis_function_linear_size(func);
+		dst->name = func->name ? strdup(func->name) : NULL;
+		dst->signature = rz_analysis_function_get_signature(func);
+		dst->callconv = func->cc ? strdup(func->cc) : NULL;
+		sil_copy_signature_to_v2(dst, signature);
+
+		if (section) {
+			ut64 section_addr = is_va ? section->vaddr : section->paddr;
+			dst->section_name = section->name ? strdup(section->name) : NULL;
+			dst->section_paddr = section->paddr;
+			if (func->addr >= section_addr) {
+				dst->section_offset = func->addr - section_addr;
+			}
+		}
+		const char *pseudocode_source = "none";
+		if (pseudocode_budget >= SIL_PSEUDOCODE_MIN_REMAINING_BYTES) {
+			dst->pseudocode = sil_extract_pseudocode(core, sil, func, &dst->loc, &dst->nos, &pseudocode_source);
+			dst->pseudocode = sil_trim_pseudocode_budget(dst->pseudocode, &dst->loc, &dst->nos, &pseudocode_budget, &pseudocode_source);
+		}
+		dst->pseudocode_source = strdup(pseudocode_source);
+		index++;
+		proto_signature_free(signature);
+	}
+
+	bundle->n_functions = index;
+	return true;
+}
+
+static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program_bundle_t *bundle) {
+	const RzHashPlugin *blake = rz_hash_plugin_by_name(core->hash, "blake3");
+	RzBinObject *bo = rz_bin_cur_object(core->bin);
+	RzAnalysis *analysis = core->analysis;
+	const char *arch = rz_config_get(core->config, RZ_ASM_ARCH);
+	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
+	size_t max_size = rz_config_get_i(core->config, RZ_SIL_PATTERN_SIZE);
+	size_t pseudocode_budget = sil_initial_pseudocode_budget(core, sil);
+	size_t n_functions = 0;
+	void **it = NULL;
+
+	if (!bo || !analysis || !bo->symbols || !blake) {
+		return false;
+	}
+
+	rz_pvector_foreach (bo->symbols, it) {
+		RzBinSymbol *symbol = (RzBinSymbol *)*it;
+		if (symbol && !symbol->is_imported && rz_analysis_get_function_at(analysis, symbol->vaddr)) {
+			n_functions++;
+		}
+	}
+
+	const RzPVector *sections = rz_bin_object_get_sections_all(bo);
+	size_t n_sections = 0;
+	rz_pvector_foreach (sections, it) {
+		RzBinSection *section = (RzBinSection *)*it;
+		if (section->perm & RZ_PERM_X) {
+			n_sections++;
+		}
+	}
+
+	if (!sil_program_bundle_alloc(bundle, n_sections, n_functions)) {
+		return false;
+	}
+
+	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : strdup("any");
+	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : strdup("any");
+	bundle->arch = sil_to_lower_dup(arch, "any");
+	bundle->bits = rz_config_get_i(core->config, RZ_ASM_BITS);
+	bundle->topk = sil->keenhash_topk;
+
+	if (!sil_collect_exec_sections(core, bundle, blake)) {
+		return false;
+	}
+
+	size_t index = 0;
+	rz_pvector_foreach (bo->symbols, it) {
+		RzBinSymbol *symbol = (RzBinSymbol *)*it;
+		if (!symbol || symbol->is_imported) {
+			continue;
+		}
+		RzAnalysisFunction *func = rz_analysis_get_function_at(analysis, symbol->vaddr);
+		if (!func) {
+			continue;
+		}
+
+		sil_function_v2_t *dst = &bundle->functions[index];
+		RzBinSection *section = rz_bin_get_section_at(bo, symbol->paddr, false);
+		Signature *signature = sil_function_to_signature(analysis, func, arch, blake, max_size);
+		if (!signature) {
+			continue;
+		}
+
+		dst->addr = func->addr;
+		dst->size = rz_analysis_function_linear_size(func);
+		dst->name = func->name ? strdup(func->name) : NULL;
+		dst->signature = rz_analysis_function_get_signature(func);
+		dst->callconv = func->cc ? strdup(func->cc) : NULL;
+		sil_copy_signature_to_v2(dst, signature);
+		if (section) {
+			ut64 section_addr = is_va ? section->vaddr : section->paddr;
+			dst->section_name = section->name ? strdup(section->name) : NULL;
+			dst->section_paddr = section->paddr;
+			if (func->addr >= section_addr) {
+				dst->section_offset = func->addr - section_addr;
+			}
+		}
+		const char *pseudocode_source = "none";
+		if (pseudocode_budget >= SIL_PSEUDOCODE_MIN_REMAINING_BYTES) {
+			dst->pseudocode = sil_extract_pseudocode(core, sil, func, &dst->loc, &dst->nos, &pseudocode_source);
+			dst->pseudocode = sil_trim_pseudocode_budget(dst->pseudocode, &dst->loc, &dst->nos, &pseudocode_budget, &pseudocode_source);
+		}
+		dst->pseudocode_source = strdup(pseudocode_source);
+		index++;
+		proto_signature_free(signature);
+	}
+
+	bundle->n_functions = index;
+	return true;
+}
+
+static void sil_apply_hint_matches(RzCore *core, const sil_resolve_result_t *matches, sil_stats_t *stats) {
+	RzAnalysisFunction *func = NULL;
+	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
+	RzBinObject *bo = rz_bin_cur_object(core->bin);
+	if (!bo) {
+		return;
+	}
+
+	for (size_t i = 0; i < matches->n_hints; ++i) {
+		const sil_hint_v2_t *hint = &matches->hints[i];
+		ut64 address = is_va ? rz_bin_object_p2v(bo, hint->offset) : hint->offset;
+		RzAnalysisFunction *existing = rz_analysis_get_function_at(core->analysis, address);
+		ut32 old_bits = existing ? existing->bits : 0;
+		rz_core_analysis_function_add(core, NULL, address, false);
+		func = rz_analysis_get_function_at(core->analysis, address);
+		if (!func || func->addr != address) {
+			rz_core_cmdf(core, "af @ 0x%" PFMT64x, address);
+			func = rz_analysis_get_function_at(core->analysis, address);
+		}
+		if (!func) {
+			continue;
+		}
+		bool changed = existing == NULL;
+		if (hint->bits > 0) {
+			if (func->bits != hint->bits) {
+				changed = true;
+			}
+			func->bits = hint->bits;
+		} else if (existing && old_bits != func->bits) {
+			changed = true;
+		}
+		if (changed) {
+			stats->hints++;
+		}
+	}
+}
+
+static void sil_apply_symbol_matches(RzCore *core, const sil_resolve_result_t *matches, sil_stats_t *stats) {
+	for (size_t i = 0; i < matches->n_symbols; ++i) {
+		const sil_symbol_match_v2_t *match = &matches->symbols[i];
+		ut64 address = match->addr;
+		RzAnalysisFunction *func = NULL;
+		if (!address && match->offset) {
+			address = sil_offset_to_addr(core, match->offset);
+		}
+		if (!address) {
+			continue;
+		}
+
+		func = rz_analysis_get_function_at(core->analysis, address);
+		if ((!func || func->addr != address) && match->offset) {
+			address = sil_offset_to_addr(core, match->offset);
+			func = rz_analysis_get_function_at(core->analysis, address);
+		}
+		if (!func || func->addr != address) {
+			func = sil_materialize_function(core, address, match->size);
+		}
+		if (func && func->addr == address && match->symbol) {
+			sil_apply_symbol(core, func, match->symbol, stats);
+			continue;
+		}
+		if (match->symbol && RZ_STR_ISNOTEMPTY(match->symbol->name)) {
+			rz_name_filter(match->symbol->name, -1, true);
+			add_named_flag_at(core, match->symbol->name, address, match->size);
+			stats->symbols++;
+		}
+	}
+}
+
 static bool sil_signature_handle(sil_t *sil, Signature *signature, RzCore *core, RzAnalysisFunction *func, sil_stats_t *stats) {
 	bool result = true;
 	Symbol *message = NULL;
@@ -395,7 +1298,7 @@ static bool sil_signature_handle(sil_t *sil, Signature *signature, RzCore *core,
 		});
 
 	if (status != STATUS__SYMBOL) {
-		sil_handle_fail_status(status);
+		result = sil_handle_fail_status(status);
 	} else if (message) {
 		sil_apply_symbol(core, func, message, stats);
 	}
@@ -424,7 +1327,7 @@ static bool sil_share_bin_handle(sil_t *sil, ShareBin *sharebin) {
 		});
 
 	if (status != STATUS__SHARE_WAS_SUCCESSFUL) {
-		sil_handle_fail_status(status);
+		result = sil_handle_fail_status(status);
 	}
 
 fail:
@@ -759,22 +1662,107 @@ static void *sil_calculate_signature_thread(sil_thread_t *context) {
 	}
 
 	free(fcn_prefix);
-	// we wait till all the signatures has been consumed and close the queue
-	rz_th_queue_close_when_empty(sigs);
+	rz_th_queue_push(sigs, context->end_marker, true);
+	context->end_marker = NULL;
 	return NULL;
 }
 
-bool sil_test_connection(sil_t *sil) {
-	rz_return_val_if_fail(sil, false);
+static bool sil_share_program_handle_v2(sil_t *sil, RzCore *core) {
+	sil_program_bundle_t bundle = { 0 };
+	sil_v2_response_t response = { 0 };
+	bool result = false;
+	RzSocket *socket = NULL;
 
-	bool old = sil->show_msg;
-	sil->show_msg = true;
-	bool res = sil_ping_handle(sil);
-	sil->show_msg = old;
-	return res;
+	if (!sil->can_share) {
+		return true;
+	}
+	RzBinObject *bo = rz_bin_cur_object(core->bin);
+	if (!bo || !sil_has_symbols(core->analysis, bo)) {
+		return true;
+	}
+	if (!sil_build_share_program_bundle(sil, core, &bundle)) {
+		goto end;
+	}
+
+	socket = sil_socket_new(sil);
+	if (!socket) {
+		goto end;
+	}
+
+	(void)sil_protocol_share_program_v2_send(socket, sil->psk, &bundle);
+	if (!sil_protocol_response_v2_recv(socket, &response)) {
+		goto end;
+	}
+
+	if (response.status != StatusV2_shareResult) {
+		if (sil_v2_can_fallback_silently(sil, response.status, &response)) {
+			goto end;
+		}
+		result = sil_handle_fail_status_v2(response.status, &response);
+		goto end;
+	}
+
+	result = true;
+
+end:
+	if (socket) {
+		rz_socket_close(socket);
+		rz_socket_free(socket);
+	}
+	sil_capnp_response_fini(&response);
+	sil_capnp_program_fini(&bundle);
+	return result;
 }
 
-bool sil_share_binary(sil_t *sil, RzCore *core) {
+static bool sil_resolve_program_handle_v2(sil_t *sil, RzCore *core, sil_stats_t *stats) {
+	sil_program_bundle_t bundle = { 0 };
+	sil_v2_response_t response = { 0 };
+	bool result = false;
+	RzSocket *socket = NULL;
+
+	if (!sil_build_resolve_program_bundle(sil, core, &bundle)) {
+		goto end;
+	}
+
+	socket = sil_socket_new(sil);
+	if (!socket) {
+		goto end;
+	}
+
+	(void)sil_protocol_resolve_program_v2_send(socket, sil->psk, &bundle);
+	if (!sil_protocol_response_v2_recv(socket, &response)) {
+		RZ_LOG_ERROR("silhouette: failed to receive capnp resolve response\n");
+		goto end;
+	}
+
+	if (response.status != StatusV2_resolveResult) {
+		if (sil_v2_can_fallback_silently(sil, response.status, &response)) {
+			goto end;
+		}
+		result = sil_handle_fail_status_v2(response.status, &response);
+		goto end;
+	}
+
+	sil_apply_hint_matches(core, &response.resolve_result, stats);
+	sil_apply_symbol_matches(core, &response.resolve_result, stats);
+	result = true;
+
+end:
+	if (socket) {
+		rz_socket_close(socket);
+		rz_socket_free(socket);
+	}
+	sil_capnp_response_fini(&response);
+	sil_capnp_program_fini(&bundle);
+	return result;
+}
+
+bool sil_test_connection(sil_t *sil, ut64 *elapsed_usec) {
+	rz_return_val_if_fail(sil, false);
+	return sil_ping_handle(sil, elapsed_usec);
+}
+
+static bool sil_share_binary_v1(sil_t *sil, RzCore *core) {
 	rz_return_val_if_fail(sil, false);
 	bool old = sil->can_share;
 	sil->can_share = true;
@@ -783,7 +1771,7 @@ bool sil_share_binary(sil_t *sil, RzCore *core) {
 	return res;
 }
 
-bool sil_resolve_functions(sil_t *sil, RzCore *core, sil_stats_t *stats) {
+static bool sil_resolve_functions_v1(sil_t *sil, RzCore *core, sil_stats_t *stats) {
 	rz_return_val_if_fail(sil && core && core->analysis && stats, false);
 	bool result = false;
 	size_t n_functions = 0;
@@ -802,7 +1790,7 @@ bool sil_resolve_functions(sil_t *sil, RzCore *core, sil_stats_t *stats) {
 		goto end;
 	}
 
-	sigs = rz_th_queue_new(n_functions, (RzListFree)sil_signature_free);
+	sigs = rz_th_queue_new(n_functions + 1, (RzListFree)sil_signature_free);
 	if (!sigs) {
 		RZ_LOG_ERROR("silhouette: failed to allocate memory (queue)\n");
 		goto end;
@@ -820,6 +1808,11 @@ bool sil_resolve_functions(sil_t *sil, RzCore *core, sil_stats_t *stats) {
 	th_info.max_size = rz_config_get_i(core->config, RZ_SIL_PATTERN_SIZE);
 	th_info.arch_name = rz_config_get(core->config, RZ_ASM_ARCH);
 	th_info.fcn_prefix = rz_config_get(core->config, RZ_ANALYSIS_FCN_PREFIX);
+	th_info.end_marker = sil_signature_new(NULL, NULL);
+	if (!th_info.end_marker) {
+		RZ_LOG_ERROR("silhouette: failed to allocate queue end marker\n");
+		goto end;
+	}
 	if (RZ_STR_ISEMPTY(th_info.fcn_prefix)) {
 		th_info.fcn_prefix = "fcn";
 	}
@@ -862,6 +1855,68 @@ bool sil_resolve_functions(sil_t *sil, RzCore *core, sil_stats_t *stats) {
 	rz_th_free(th);
 
 end:
+	sil_signature_free(th_info.end_marker);
 	rz_th_queue_free(sigs);
 	return result;
+}
+
+bool sil_share_binary(sil_t *sil, RzCore *core) {
+	rz_return_val_if_fail(sil, false);
+	bool old = sil->can_share;
+	sil->can_share = true;
+
+	if (sil_prefers_capnp(sil) && sil_share_program_handle_v2(sil, core)) {
+		sil->can_share = old;
+		return true;
+	}
+	if (sil_prefers_capnp(sil) && sil_can_fallback_to_protobuf(sil)) {
+		RZ_LOG_INFO("silhouette: falling back to protobuf share.\n");
+	} else if (sil_prefers_capnp(sil)) {
+		sil->can_share = old;
+		return false;
+	}
+
+	bool res = sil_share_binary_v1(sil, core);
+	sil->can_share = old;
+	return res;
+}
+
+bool sil_resolve_functions(sil_t *sil, RzCore *core, sil_stats_t *stats) {
+	rz_return_val_if_fail(sil && core && core->analysis && stats, false);
+	memset(stats, 0, sizeof(*stats));
+
+	if (sil_prefers_capnp(sil)) {
+		bool shared = sil_share_program_handle_v2(sil, core);
+		bool resolved = false;
+		if (shared) {
+			sil_stats_t total = { 0 };
+			for (ut32 pass = 0; pass < 3; ++pass) {
+				sil_stats_t round = { 0 };
+				if (!sil_resolve_program_handle_v2(sil, core, &round)) {
+					resolved = false;
+					break;
+				}
+				total.hints += round.hints;
+				total.symbols += round.symbols;
+				resolved = true;
+				if (round.hints == 0) {
+					break;
+				}
+			}
+			if (resolved) {
+				*stats = total;
+			}
+		}
+		if (resolved) {
+			return true;
+		}
+		if (sil_can_fallback_to_protobuf(sil)) {
+			RZ_LOG_INFO("silhouette: falling back to protobuf resolve.\n");
+			memset(stats, 0, sizeof(*stats));
+		} else {
+			return false;
+		}
+	}
+
+	return sil_resolve_functions_v1(sil, core, stats);
 }

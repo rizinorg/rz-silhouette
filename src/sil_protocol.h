@@ -6,6 +6,7 @@
 #define SIL_PROTOCOL_H
 
 #include "sil.h"
+#include "sil_capnp.h"
 #include "sil_helpers.h"
 
 bool sil_protocol_ping_send(RzSocket *socket, const char *psk);

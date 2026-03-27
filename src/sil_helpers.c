@@ -252,7 +252,7 @@ Request *proto_request_new(const char *psk, Route route) {
 	request__init(request);
 
 	request->psk = psk ? strdup(psk) : NULL;
-	request->version = RZ_SIL_VERSION;
+	request->version = RZ_SIL_VERSION_PROTOBUF;
 	request->route = route;
 	return request;
 }
