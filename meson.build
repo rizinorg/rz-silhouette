@@ -80,33 +80,6 @@ if rizin_plugdir == ''
   endif
 endif
 
-sys_protobuf_c_opt = get_option('use_sys_protobuf_c')
-protobuf_c_dep = disabler()
-protobuf_c_is_system = false
-if sys_protobuf_c_opt.enabled() or sys_protobuf_c_opt.auto()
-  foreach protobuf_name : ['libprotobuf-c', 'protobuf-c']
-    if protobuf_c_dep.found()
-      break
-    endif
-    protobuf_c_dep = dependency(protobuf_name, required: false)
-    if not protobuf_c_dep.found()
-      protobuf_c_dep = cc.find_library(protobuf_name, required: false)
-    endif
-  endforeach
-  protobuf_c_is_system = protobuf_c_dep.found()
-endif
-if sys_protobuf_c_opt.enabled() and not protobuf_c_dep.found()
-  error('System protobuf-c runtime not found')
-endif
-if (sys_protobuf_c_opt.auto() and not protobuf_c_dep.found()) or sys_protobuf_c_opt.disabled()
-  protobuf_c_proj = subproject('protobuf-c', default_options: ['default_library=static'])
-  protobuf_c_dep = protobuf_c_proj.get_variable('protobuf_c_dep')
-  protobuf_c_is_system = false
-endif
-if windows_host and protobuf_c_is_system
-  rz_silhouette_c_args += ['-DPROTOBUF_C_USE_SHARED_LIB']
-endif
-
 capnp_tool = find_program('capnp', required: true)
 sys_capnp_c_opt = get_option('use_sys_capnp_c')
 capnp_c_dep = disabler()
@@ -146,7 +119,6 @@ capnp_generated = custom_target(
 rz_silhouette_deps = [
   rz_core_dep,
   dependency('threads', required: true),
-  protobuf_c_dep,
   capnp_c_dep,
 ]
 
@@ -154,11 +126,9 @@ rz_silhouette_incs = include_directories('.', 'src')
 rz_silhouette_src = [
   'src' / 'sil_client.c',
   'src' / 'sil_capnp.c',
-  'src' / 'sil_helpers.c',
   'src' / 'sil_plugin.c',
   'src' / 'sil_protocol.c',
   capnp_generated,
-  'src' / 'service.pb-c.c',
 ]
 
 if cc.has_argument('-fPIC')

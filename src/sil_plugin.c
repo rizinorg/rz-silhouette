@@ -61,10 +61,6 @@ static sil_t *sil_plugin_create(RzCore *core) {
 		.can_share = rz_config_get_b(core->config, RZ_SIL_SHARE),
 		.can_share_sections = rz_config_get_b(core->config, RZ_SIL_SHARE_SECTIONS),
 		.can_share_symbols = rz_config_get_b(core->config, RZ_SIL_SHARE_SYMBOLS),
-		.codec = rz_config_get(core->config, RZ_SIL_CODEC),
-		.keenhash = rz_config_get_b(core->config, RZ_SIL_KEENHASH),
-		.keenhash_topk = rz_config_get_i(core->config, RZ_SIL_KEENHASH_TOPK),
-		.decompiler = rz_config_get(core->config, RZ_SIL_DECOMPILER),
 	};
 	return sil_new(&opts);
 }
@@ -109,9 +105,14 @@ RZ_IPI bool sil_plugin_analysis(RzCore *core) {
 	}
 
 	sil_stats_t stats = { 0 };
-	rz_core_notify_begin(core, "Resolving symbols using the silhouette server...");
+	bool interactive = rz_cons_is_interactive();
+	if (interactive) {
+		rz_core_notify_begin(core, "Resolving symbols using the silhouette server...");
+	}
 	bool result = sil_resolve_functions(sil, core, &stats);
-	rz_core_notify_done(core, "Applied %u hints and %u symbols using the silhouette server.", stats.hints, stats.symbols);
+	if (interactive) {
+		rz_core_notify_done(core, "Applied %u hints and %u symbols using the silhouette server.", stats.hints, stats.symbols);
+	}
 
 	sil_free(sil);
 	return result;
@@ -132,10 +133,6 @@ static void sil_setup_evars(RzConfig *cfg) {
 	SETPREFB(RZ_SIL_SHARE, RZ_SIL_SHARE_DEFAULT, RZ_SIL_SHARE_DESCR);
 	SETPREFB(RZ_SIL_SHARE_SECTIONS, RZ_SIL_SHARE_SECTIONS_DEFAULT, RZ_SIL_SHARE_SECTIONS_DESCR);
 	SETPREFB(RZ_SIL_SHARE_SYMBOLS, RZ_SIL_SHARE_SYMBOLS_DEFAULT, RZ_SIL_SHARE_SYMBOLS_DESCR);
-	SETPREFS(RZ_SIL_CODEC, RZ_SIL_CODEC_DEFAULT, RZ_SIL_CODEC_DESCR);
-	SETPREFB(RZ_SIL_KEENHASH, RZ_SIL_KEENHASH_DEFAULT, RZ_SIL_KEENHASH_DESCR);
-	SETPREFI(RZ_SIL_KEENHASH_TOPK, RZ_SIL_KEENHASH_TOPK_DEFAULT, RZ_SIL_KEENHASH_TOPK_DESCR);
-	SETPREFS(RZ_SIL_DECOMPILER, RZ_SIL_DECOMPILER_DEFAULT, RZ_SIL_DECOMPILER_DESCR);
 	rz_config_lock(cfg, true);
 }
 

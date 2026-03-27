@@ -9,15 +9,8 @@
 #include <rz_cmd.h>
 #include <rz_analysis.h>
 #include <rz_socket.h>
-#include <rz_th.h>
 
 #include "sil_const.h"
-
-typedef enum sil_codec_mode_e {
-	SIL_CODEC_AUTO = 0,
-	SIL_CODEC_PROTOBUF,
-	SIL_CODEC_CAPNP,
-} sil_codec_mode_t;
 
 typedef struct sil_opt_s {
 	const char *psk;
@@ -29,10 +22,6 @@ typedef struct sil_opt_s {
 	bool can_share;
 	bool can_share_sections;
 	bool can_share_symbols;
-	const char *codec;
-	bool keenhash;
-	ut32 keenhash_topk;
-	const char *decompiler;
 } sil_opt_t;
 
 typedef struct sil_s sil_t;

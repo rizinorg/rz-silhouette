@@ -7,6 +7,5 @@ curl-example
 curl-example-dbg
 subprojects/c-capnproto/
 subprojects/packagecache/
-subprojects/protobuf-c/
 src/service.capnp.c
 src/service.capnp.h

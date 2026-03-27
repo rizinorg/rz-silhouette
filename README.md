@@ -19,21 +19,16 @@ e silhouette.host=<server>
 e silhouette.port=<port>
 # available only if rizin was built with openssl
 e silhouette.tls=true
-e silhouette.codec=auto
-e silhouette.keenhash=true
-e silhouette.keenhash.topk=10
-e silhouette.decompiler=rz-ghidra
 ```
 
-`silhouette.codec=auto` prefers Cap'n Proto v2 and falls back to protobuf when needed.
-`silhouette.decompiler=off` disables the pseudocode bundle and keeps exact matching only.
-Cap'n Proto v2 changes serialization only. On the raw TCP port the PSK is still sent in clear text, so use `e silhouette.tls=true` against a TLS listener when confidentiality matters.
+The client uses a single Cap'n Proto protocol.
+Cap'n Proto changes serialization only. On the raw TCP port the PSK is still sent in clear text, so use `e silhouette.tls=true` against a TLS listener when confidentiality matters.
 
 To test if the credentials are correct, you can open rizin and execute the following command.
 ```
 [0x00000000]> sil test
 
-Hello World from the server!
+silhouette server: protocol 1, tls=optional
 response delay: 2.5ms
 ```
 
