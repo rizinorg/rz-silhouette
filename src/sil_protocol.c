@@ -7,6 +7,7 @@
  */
 
 #include "sil_protocol.h"
+#include <limits.h>
 
 #define SIL_HEADER_SIZE (sizeof(ut32))
 #define SIL_CAPNP_MAGIC "SIL2"
@@ -40,6 +41,14 @@ static bool sil_socket_read_all(RzSocket *socket, ut8 *buffer, size_t size) {
 		return true;
 	}
 	return rz_socket_read_block(socket, buffer, (int)size) == (int)size;
+}
+
+static bool sil_capnp_ptr_valid(capn_ptr ptr) {
+	return ptr.type != CAPN_NULL && ptr.seg != NULL;
+}
+
+static bool sil_capnp_list_size_valid(size_t size) {
+	return size <= (size_t)INT_MAX;
 }
 
 static bool sil_protocol_request_send(RzSocket *socket, Request *request) {
@@ -134,13 +143,13 @@ bool sil_protocol_binary_send(RzSocket *socket, const char *psk, Binary *binary)
 	size_t size = binary__get_packed_size(binary);
 	ut8 *message = malloc(size);
 	if (!message) {
-		RZ_LOG_ERROR("silhouette: failed to allocate share bin packed bytes\n");
+		RZ_LOG_ERROR("silhouette: failed to allocate binary request bytes\n");
 		return false;
 	}
 
 	Request *req = proto_request_binary_new(psk);
 	if (!req) {
-		RZ_LOG_ERROR("silhouette: failed to allocate request share bin\n");
+		RZ_LOG_ERROR("silhouette: failed to allocate binary request\n");
 		free(message);
 		return false;
 	}
@@ -155,13 +164,13 @@ bool sil_protocol_signature_send(RzSocket *socket, const char *psk, Signature *s
 	size_t size = signature__get_packed_size(signature);
 	ut8 *message = malloc(size);
 	if (!message) {
-		RZ_LOG_ERROR("silhouette: failed to allocate share bin packed bytes\n");
+		RZ_LOG_ERROR("silhouette: failed to allocate signature request bytes\n");
 		return false;
 	}
 
 	Request *req = proto_request_signature_new(psk);
 	if (!req) {
-		RZ_LOG_ERROR("silhouette: failed to allocate request share bin\n");
+		RZ_LOG_ERROR("silhouette: failed to allocate signature request\n");
 		free(message);
 		return false;
 	}
@@ -176,13 +185,13 @@ bool sil_protocol_share_bin_send(RzSocket *socket, const char *psk, ShareBin *sh
 	size_t size = share_bin__get_packed_size(sharebin);
 	ut8 *message = malloc(size);
 	if (!message) {
-		RZ_LOG_ERROR("silhouette: failed to allocate share bin packed bytes\n");
+		RZ_LOG_ERROR("silhouette: failed to allocate share request bytes\n");
 		return false;
 	}
 
 	Request *req = proto_request_share_bin_new(psk);
 	if (!req) {
-		RZ_LOG_ERROR("silhouette: failed to allocate request share bin\n");
+		RZ_LOG_ERROR("silhouette: failed to allocate share request\n");
 		free(message);
 		return false;
 	}
@@ -213,24 +222,81 @@ static char *sil_capnp_strdup(capn_text text) {
 	return dup;
 }
 
-static capn_data sil_capnp_data_new(struct capn_segment *seg, const ut8 *data, size_t size) {
-	capn_data out = { 0 };
-	if (!data || size < 1) {
-		return out;
+static bool sil_capnp_data_new(struct capn_segment *seg, const ut8 *data, size_t size, capn_data *out) {
+	if (!out) {
+		return false;
 	}
-	out.p = capn_new_list8(seg, (int)size).p;
-	capn_setv8((capn_list8){ out.p }, 0, data, (int)size);
-	return out;
+	memset(out, 0, sizeof(*out));
+	if (!data || size < 1) {
+		return true;
+	}
+	if (!sil_capnp_list_size_valid(size)) {
+		return false;
+	}
+
+	capn_list8 list = capn_new_list8(seg, (int)size);
+	if (!sil_capnp_ptr_valid(list.p)) {
+		return false;
+	}
+	if (capn_setv8(list, 0, data, (int)size) != (int)size) {
+		return false;
+	}
+
+	out->p = list.p;
+	return true;
 }
 
-static capn_list64 sil_capnp_u64_list_new(struct capn_segment *seg, const ut64 *data, size_t size) {
-	capn_list64 out = { 0 };
-	if (!data || size < 1) {
-		return out;
+static bool sil_capnp_u64_list_new(struct capn_segment *seg, const ut64 *data, size_t size, capn_list64 *out) {
+	if (!out) {
+		return false;
 	}
-	out = capn_new_list64(seg, (int)size);
-	capn_setv64(out, 0, data, (int)size);
-	return out;
+	memset(out, 0, sizeof(*out));
+	if (!data || size < 1) {
+		return true;
+	}
+	if (!sil_capnp_list_size_valid(size)) {
+		return false;
+	}
+
+	*out = capn_new_list64(seg, (int)size);
+	if (!sil_capnp_ptr_valid(out->p)) {
+		return false;
+	}
+	return capn_setv64(*out, 0, data, (int)size) == (int)size;
+}
+
+static bool sil_protocol_capnp_send_frame(RzSocket *socket, ut8 *buffer, size_t header_bytes, int64_t written) {
+	if (written < 0 || (uint64_t)written > (uint64_t)(UINT32_MAX - strlen(SIL_CAPNP_MAGIC))) {
+		return false;
+	}
+
+	ut32 body_size = (ut32)(strlen(SIL_CAPNP_MAGIC) + written);
+	rz_write_be32(buffer, body_size);
+	bool sent = sil_socket_write_all(socket, buffer, body_size + SIL_HEADER_SIZE);
+	rz_socket_flush(socket);
+	return sent;
+}
+
+static bool sil_protocol_capnp_try_encode(RzSocket *socket, struct capn *ctx, bool packed, size_t payload_cap, size_t header_bytes) {
+	if (payload_cap > SIZE_MAX - header_bytes) {
+		return false;
+	}
+
+	ut8 *buffer = malloc(header_bytes + payload_cap);
+	if (!buffer) {
+		return false;
+	}
+
+	memcpy(buffer + SIL_HEADER_SIZE, SIL_CAPNP_MAGIC, strlen(SIL_CAPNP_MAGIC));
+	int64_t written = capn_write_mem(ctx, buffer + header_bytes, payload_cap, packed ? 1 : 0);
+	if (written < 0) {
+		free(buffer);
+		return false;
+	}
+
+	bool sent = sil_protocol_capnp_send_frame(socket, buffer, header_bytes, written);
+	free(buffer);
+	return sent;
 }
 
 static bool sil_protocol_capnp_send_ctx(RzSocket *socket, struct capn *ctx) {
@@ -244,27 +310,9 @@ static bool sil_protocol_capnp_send_ctx(RzSocket *socket, struct capn *ctx) {
 		size_t payload_cap = packed ? (size_t)message_max + ((size_t)message_max / 8U) + 64U : (size_t)message_max;
 		size_t max_attempts = packed ? 4U : 1U;
 		for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
-			if (payload_cap > SIZE_MAX - header_bytes) {
-				return false;
+			if (sil_protocol_capnp_try_encode(socket, ctx, packed != 0, payload_cap, header_bytes)) {
+				return true;
 			}
-
-			ut8 *buffer = malloc(header_bytes + payload_cap);
-			if (!buffer) {
-				return false;
-			}
-
-			memcpy(buffer + SIL_HEADER_SIZE, SIL_CAPNP_MAGIC, strlen(SIL_CAPNP_MAGIC));
-			int64_t written = capn_write_mem(ctx, buffer + header_bytes, payload_cap, packed);
-			if (written >= 0) {
-				ut32 body_size = (ut32)(strlen(SIL_CAPNP_MAGIC) + written);
-				rz_write_be32(buffer, body_size);
-				bool sent = sil_socket_write_all(socket, buffer, body_size + SIL_HEADER_SIZE);
-				rz_socket_flush(socket);
-				free(buffer);
-				return sent;
-			}
-
-			free(buffer);
 			if (!packed || payload_cap > (SIZE_MAX / 2U)) {
 				break;
 			}
@@ -278,7 +326,7 @@ static bool sil_protocol_capnp_send_ctx(RzSocket *socket, struct capn *ctx) {
 
 static ProgramBundleV2_ptr sil_capnp_program_new(struct capn_segment *seg, const sil_program_bundle_t *program) {
 	ProgramBundleV2_ptr out = new_ProgramBundleV2(seg);
-	if (!program) {
+	if (!sil_capnp_ptr_valid(out.p) || !program) {
 		return out;
 	}
 
@@ -290,21 +338,40 @@ static ProgramBundleV2_ptr sil_capnp_program_new(struct capn_segment *seg, const
 	ProgramBundleV2_set_topk(out, program->topk);
 
 	if (program->n_sections > 0) {
+		if (!sil_capnp_list_size_valid(program->n_sections)) {
+			out.p.type = CAPN_NULL;
+			return out;
+		}
 		SectionHashV2_list sections = new_SectionHashV2_list(seg, (int)program->n_sections);
+		if (!sil_capnp_ptr_valid(sections.p)) {
+			out.p.type = CAPN_NULL;
+			return out;
+		}
 		for (size_t i = 0; i < program->n_sections; ++i) {
 			const sil_section_v2_t *section = &program->sections[i];
 			struct SectionHashV2 item = { 0 };
 			item.name = sil_capnp_text(section->name);
 			item.size = section->size;
 			item.paddr = section->paddr;
-			item.digest = sil_capnp_data_new(seg, section->digest, section->digest_size);
+			if (!sil_capnp_data_new(seg, section->digest, section->digest_size, &item.digest)) {
+				out.p.type = CAPN_NULL;
+				return out;
+			}
 			set_SectionHashV2(&item, sections, (int)i);
 		}
 		ProgramBundleV2_set_sections(out, sections);
 	}
 
 	if (program->n_functions > 0) {
+		if (!sil_capnp_list_size_valid(program->n_functions)) {
+			out.p.type = CAPN_NULL;
+			return out;
+		}
 		FunctionBundleV2_list functions = new_FunctionBundleV2_list(seg, (int)program->n_functions);
+		if (!sil_capnp_ptr_valid(functions.p)) {
+			out.p.type = CAPN_NULL;
+			return out;
+		}
 		for (size_t i = 0; i < program->n_functions; ++i) {
 			const sil_function_v2_t *function = &program->functions[i];
 			struct FunctionBundleV2 item = { 0 };
@@ -313,7 +380,10 @@ static ProgramBundleV2_ptr sil_capnp_program_new(struct capn_segment *seg, const
 			item.bits = function->bits;
 			item.arch = sil_capnp_text(function->arch);
 			item.length = function->length;
-			item.digest = sil_capnp_data_new(seg, function->digest, function->digest_size);
+			if (!sil_capnp_data_new(seg, function->digest, function->digest_size, &item.digest)) {
+				out.p.type = CAPN_NULL;
+				return out;
+			}
 			item.sectionName = sil_capnp_text(function->section_name);
 			item.sectionPaddr = function->section_paddr;
 			item.sectionOffset = function->section_offset;
@@ -321,7 +391,10 @@ static ProgramBundleV2_ptr sil_capnp_program_new(struct capn_segment *seg, const
 			item.nos = function->nos;
 			item.pseudocode = sil_capnp_text(function->pseudocode);
 			item.pseudocodeSource = sil_capnp_text(function->pseudocode_source);
-			item.calls = sil_capnp_u64_list_new(seg, function->calls, function->n_calls);
+			if (!sil_capnp_u64_list_new(seg, function->calls, function->n_calls, &item.calls)) {
+				out.p.type = CAPN_NULL;
+				return out;
+			}
 			item.name = sil_capnp_text(function->name);
 			item.signature = sil_capnp_text(function->signature);
 			item.callconv = sil_capnp_text(function->callconv);
@@ -337,6 +410,10 @@ bool sil_protocol_ping_v2_send(RzSocket *socket, const char *psk) {
 	struct capn ctx;
 	capn_init_malloc(&ctx);
 	PingV2_ptr ping = new_PingV2(capn_root(&ctx).seg);
+	if (!sil_capnp_ptr_valid(ping.p)) {
+		capn_free(&ctx);
+		return false;
+	}
 
 	struct RequestV2 request = { 0 };
 	request.psk = sil_capnp_text(psk);
@@ -346,6 +423,10 @@ bool sil_protocol_ping_v2_send(RzSocket *socket, const char *psk) {
 	request.ping = ping;
 
 	RequestV2_ptr reqp = new_RequestV2(capn_root(&ctx).seg);
+	if (!sil_capnp_ptr_valid(reqp.p)) {
+		capn_free(&ctx);
+		return false;
+	}
 	write_RequestV2(&request, reqp);
 	bool ok = capn_setp(capn_root(&ctx), 0, reqp.p) == 0;
 	if (!ok) {
@@ -361,7 +442,15 @@ bool sil_protocol_resolve_program_v2_send(RzSocket *socket, const char *psk, con
 	struct capn ctx;
 	capn_init_malloc(&ctx);
 	ProgramBundleV2_ptr prog = sil_capnp_program_new(capn_root(&ctx).seg, program);
+	if (!sil_capnp_ptr_valid(prog.p)) {
+		capn_free(&ctx);
+		return false;
+	}
 	ResolveProgramV2_ptr resolve = new_ResolveProgramV2(capn_root(&ctx).seg);
+	if (!sil_capnp_ptr_valid(resolve.p)) {
+		capn_free(&ctx);
+		return false;
+	}
 	ResolveProgramV2_set_program(resolve, prog);
 
 	struct RequestV2 request = { 0 };
@@ -372,6 +461,10 @@ bool sil_protocol_resolve_program_v2_send(RzSocket *socket, const char *psk, con
 	request.resolveProgram = resolve;
 
 	RequestV2_ptr reqp = new_RequestV2(capn_root(&ctx).seg);
+	if (!sil_capnp_ptr_valid(reqp.p)) {
+		capn_free(&ctx);
+		return false;
+	}
 	write_RequestV2(&request, reqp);
 	bool ok = capn_setp(capn_root(&ctx), 0, reqp.p) == 0;
 	if (!ok) {
@@ -387,7 +480,15 @@ bool sil_protocol_share_program_v2_send(RzSocket *socket, const char *psk, const
 	struct capn ctx;
 	capn_init_malloc(&ctx);
 	ProgramBundleV2_ptr prog = sil_capnp_program_new(capn_root(&ctx).seg, program);
+	if (!sil_capnp_ptr_valid(prog.p)) {
+		capn_free(&ctx);
+		return false;
+	}
 	ShareProgramV2_ptr share = new_ShareProgramV2(capn_root(&ctx).seg);
+	if (!sil_capnp_ptr_valid(share.p)) {
+		capn_free(&ctx);
+		return false;
+	}
 	ShareProgramV2_set_program(share, prog);
 
 	struct RequestV2 request = { 0 };
@@ -398,6 +499,10 @@ bool sil_protocol_share_program_v2_send(RzSocket *socket, const char *psk, const
 	request.shareProgram = share;
 
 	RequestV2_ptr reqp = new_RequestV2(capn_root(&ctx).seg);
+	if (!sil_capnp_ptr_valid(reqp.p)) {
+		capn_free(&ctx);
+		return false;
+	}
 	write_RequestV2(&request, reqp);
 	bool ok = capn_setp(capn_root(&ctx), 0, reqp.p) == 0;
 	if (!ok) {

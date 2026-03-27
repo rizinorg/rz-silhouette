@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 RizinOrg <info@rizin.re>
 # SPDX-License-Identifier: LGPL-3.0-only
 
-using C = import "/c.capnp";
-using Go = import "/go.capnp";
+using C = import "capnp/c.capnp";
+using Go = import "capnp/go.capnp";
 
 @0xa0f8f4ce58fdd4d6;
 

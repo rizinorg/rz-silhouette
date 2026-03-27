@@ -27,6 +27,7 @@ e silhouette.decompiler=rz-ghidra
 
 `silhouette.codec=auto` prefers Cap'n Proto v2 and falls back to protobuf when needed.
 `silhouette.decompiler=off` disables the pseudocode bundle and keeps exact matching only.
+Cap'n Proto v2 changes serialization only. On the raw TCP port the PSK is still sent in clear text, so use `e silhouette.tls=true` against a TLS listener when confidentiality matters.
 
 To test if the credentials are correct, you can open rizin and execute the following command.
 ```
@@ -35,6 +36,10 @@ To test if the credentials are correct, you can open rizin and execute the follo
 Hello World from the server!
 response delay: 2.5ms
 ```
+
+## Build Notes
+
+The client Cap'n Proto C bindings are generated at build time from `src/service.capnp`. A clean build requires the `capnp` tool on `PATH`; Meson will use the bundled `c-capnproto` generator automatically unless `-Duse_sys_capnp_c=enabled` is selected.
 
 ## Documentation
 

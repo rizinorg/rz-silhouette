@@ -5,8 +5,8 @@
 /** \file sil_client.c
  * Implements the tcp protocol to talk to the server.
  *
- * The protocol is very simple, push the size of the data
- * stream that is sent afterwards as a packed protobuf structure.
+ * The wire format is a 4-byte big-endian size prefix followed by either the
+ * legacy protobuf payload or a SIL2-prefixed Cap'n Proto v2 payload.
  */
 
 #include "sil.h"
@@ -478,6 +478,7 @@ static bool sil_ping_handle_v2(sil_t *sil, ut64 *elapsed_usec) {
 			goto fail;
 		});
 	sil_measure_latency_add(elapsed_usec, started_usec);
+	sil_capnp_debug_dump_response("ping", &response);
 
 	if (response.status != StatusV2_serverInfo) {
 		if (sil_v2_can_fallback_silently(sil, response.status, &response)) {
@@ -978,29 +979,56 @@ static bool sil_program_bundle_alloc(sil_program_bundle_t *bundle, size_t sectio
 	return (sections == 0 || bundle->sections) && (functions == 0 || bundle->functions);
 }
 
-static void sil_copy_section_to_v2(sil_section_v2_t *dst, const RzBinSection *section, SectionHash *hash) {
+static ut8 *sil_memdup_or_null(const ut8 *data, size_t size) {
+	if (!data || size < 1) {
+		return NULL;
+	}
+	ut8 *dup = malloc(size);
+	if (!dup) {
+		return NULL;
+	}
+	memcpy(dup, data, size);
+	return dup;
+}
+
+static bool sil_copy_section_to_v2(sil_section_v2_t *dst, const RzBinSection *section, SectionHash *hash) {
+	if (!dst) {
+		return false;
+	}
 	dst->name = section && section->name ? strdup(section->name) : NULL;
+	if (section && section->name && !dst->name) {
+		return false;
+	}
 	dst->size = hash ? hash->size : 0;
 	dst->paddr = hash ? hash->paddr : 0;
 	dst->digest_size = hash ? hash->digest.len : 0;
 	if (dst->digest_size > 0) {
-		dst->digest = malloc(dst->digest_size);
-		memcpy(dst->digest, hash->digest.data, dst->digest_size);
+		dst->digest = sil_memdup_or_null(hash->digest.data, dst->digest_size);
+		if (!dst->digest) {
+			return false;
+		}
 	}
+	return true;
 }
 
-static void sil_copy_signature_to_v2(sil_function_v2_t *dst, Signature *signature) {
+static bool sil_copy_signature_to_v2(sil_function_v2_t *dst, Signature *signature) {
 	if (!dst || !signature) {
-		return;
+		return false;
 	}
 	dst->bits = signature->bits;
 	dst->length = signature->length;
 	dst->arch = signature->arch ? strdup(signature->arch) : NULL;
+	if (signature->arch && !dst->arch) {
+		return false;
+	}
 	dst->digest_size = signature->digest.len;
 	if (dst->digest_size > 0) {
-		dst->digest = malloc(dst->digest_size);
-		memcpy(dst->digest, signature->digest.data, dst->digest_size);
+		dst->digest = sil_memdup_or_null(signature->digest.data, dst->digest_size);
+		if (!dst->digest) {
+			return false;
+		}
 	}
+	return true;
 }
 
 static bool sil_collect_exec_sections(RzCore *core, sil_program_bundle_t *bundle, const RzHashPlugin *blake) {
@@ -1020,7 +1048,10 @@ static bool sil_collect_exec_sections(RzCore *core, sil_program_bundle_t *bundle
 		if (!hash) {
 			return false;
 		}
-		sil_copy_section_to_v2(&bundle->sections[index], section, hash);
+		if (!sil_copy_section_to_v2(&bundle->sections[index], section, hash)) {
+			proto_section_hash_free(hash);
+			return false;
+		}
 		index++;
 		proto_section_hash_free(hash);
 	}
@@ -1071,6 +1102,9 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : strdup("any");
 	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : strdup("any");
 	bundle->arch = sil_to_lower_dup(arch, "any");
+	if (!bundle->binary_type || !bundle->os || !bundle->arch) {
+		return false;
+	}
 	bundle->bits = rz_config_get_i(core->config, RZ_ASM_BITS);
 	bundle->topk = sil->keenhash_topk;
 
@@ -1096,11 +1130,18 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 		dst->name = func->name ? strdup(func->name) : NULL;
 		dst->signature = rz_analysis_function_get_signature(func);
 		dst->callconv = func->cc ? strdup(func->cc) : NULL;
-		sil_copy_signature_to_v2(dst, signature);
+		if ((func->name && !dst->name) || (func->cc && !dst->callconv) || !sil_copy_signature_to_v2(dst, signature)) {
+			proto_signature_free(signature);
+			return false;
+		}
 
 		if (section) {
 			ut64 section_addr = is_va ? section->vaddr : section->paddr;
 			dst->section_name = section->name ? strdup(section->name) : NULL;
+			if (section->name && !dst->section_name) {
+				proto_signature_free(signature);
+				return false;
+			}
 			dst->section_paddr = section->paddr;
 			if (func->addr >= section_addr) {
 				dst->section_offset = func->addr - section_addr;
@@ -1112,6 +1153,10 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 			dst->pseudocode = sil_trim_pseudocode_budget(dst->pseudocode, &dst->loc, &dst->nos, &pseudocode_budget, &pseudocode_source);
 		}
 		dst->pseudocode_source = strdup(pseudocode_source);
+		if (!dst->pseudocode_source) {
+			proto_signature_free(signature);
+			return false;
+		}
 		index++;
 		proto_signature_free(signature);
 	}
@@ -1158,6 +1203,9 @@ static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program
 	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : strdup("any");
 	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : strdup("any");
 	bundle->arch = sil_to_lower_dup(arch, "any");
+	if (!bundle->binary_type || !bundle->os || !bundle->arch) {
+		return false;
+	}
 	bundle->bits = rz_config_get_i(core->config, RZ_ASM_BITS);
 	bundle->topk = sil->keenhash_topk;
 
@@ -1188,10 +1236,17 @@ static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program
 		dst->name = func->name ? strdup(func->name) : NULL;
 		dst->signature = rz_analysis_function_get_signature(func);
 		dst->callconv = func->cc ? strdup(func->cc) : NULL;
-		sil_copy_signature_to_v2(dst, signature);
+		if ((func->name && !dst->name) || (func->cc && !dst->callconv) || !sil_copy_signature_to_v2(dst, signature)) {
+			proto_signature_free(signature);
+			return false;
+		}
 		if (section) {
 			ut64 section_addr = is_va ? section->vaddr : section->paddr;
 			dst->section_name = section->name ? strdup(section->name) : NULL;
+			if (section->name && !dst->section_name) {
+				proto_signature_free(signature);
+				return false;
+			}
 			dst->section_paddr = section->paddr;
 			if (func->addr >= section_addr) {
 				dst->section_offset = func->addr - section_addr;
@@ -1203,6 +1258,10 @@ static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program
 			dst->pseudocode = sil_trim_pseudocode_budget(dst->pseudocode, &dst->loc, &dst->nos, &pseudocode_budget, &pseudocode_source);
 		}
 		dst->pseudocode_source = strdup(pseudocode_source);
+		if (!dst->pseudocode_source) {
+			proto_signature_free(signature);
+			return false;
+		}
 		index++;
 		proto_signature_free(signature);
 	}
@@ -1683,6 +1742,7 @@ static bool sil_share_program_handle_v2(sil_t *sil, RzCore *core) {
 	if (!sil_build_share_program_bundle(sil, core, &bundle)) {
 		goto end;
 	}
+	sil_capnp_debug_dump_program("share", &bundle);
 
 	socket = sil_socket_new(sil);
 	if (!socket) {
@@ -1693,6 +1753,7 @@ static bool sil_share_program_handle_v2(sil_t *sil, RzCore *core) {
 	if (!sil_protocol_response_v2_recv(socket, &response)) {
 		goto end;
 	}
+	sil_capnp_debug_dump_response("share", &response);
 
 	if (response.status != StatusV2_shareResult) {
 		if (sil_v2_can_fallback_silently(sil, response.status, &response)) {
@@ -1723,6 +1784,7 @@ static bool sil_resolve_program_handle_v2(sil_t *sil, RzCore *core, sil_stats_t 
 	if (!sil_build_resolve_program_bundle(sil, core, &bundle)) {
 		goto end;
 	}
+	sil_capnp_debug_dump_program("resolve", &bundle);
 
 	socket = sil_socket_new(sil);
 	if (!socket) {
@@ -1734,6 +1796,7 @@ static bool sil_resolve_program_handle_v2(sil_t *sil, RzCore *core, sil_stats_t 
 		RZ_LOG_ERROR("silhouette: failed to receive capnp resolve response\n");
 		goto end;
 	}
+	sil_capnp_debug_dump_response("resolve", &response);
 
 	if (response.status != StatusV2_resolveResult) {
 		if (sil_v2_can_fallback_silently(sil, response.status, &response)) {

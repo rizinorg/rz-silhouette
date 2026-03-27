@@ -112,6 +112,8 @@ typedef struct {
 
 void sil_capnp_program_fini(sil_program_bundle_t *program);
 void sil_capnp_response_fini(sil_v2_response_t *response);
+void sil_capnp_debug_dump_program(const char *label, const sil_program_bundle_t *program);
+void sil_capnp_debug_dump_response(const char *label, const sil_v2_response_t *response);
 
 bool sil_protocol_ping_v2_send(RzSocket *socket, const char *psk);
 bool sil_protocol_resolve_program_v2_send(RzSocket *socket, const char *psk, const sil_program_bundle_t *program);
