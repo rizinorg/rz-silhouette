@@ -269,19 +269,20 @@ static RzSocket *sil_socket_new(sil_t *sil) {
 }
 
 static bool sil_handle_fail_status(enum SilStatus status, const sil_response_t *response) {
-	const char *message = response && response->which == SilResponse_message ? response->text : NULL;
+	bool has_message = response && response->which == SilResponse_message && RZ_STR_ISNOTEMPTY(response->text);
+	const char *message = rz_str_get(has_message ? response->text : NULL);
 	switch (status) {
 	case SilStatus_internalError:
-		RZ_LOG_ERROR("silhouette: internal server error%s%s.\n", message ? ": " : "", message ? message : "");
+		RZ_LOG_ERROR("silhouette: internal server error%s%s.\n", has_message ? ": " : "", message);
 		return false;
 	case SilStatus_clientBadPreSharedKey:
-		RZ_LOG_ERROR("silhouette: server did not accept the current psk%s%s.\n", message ? ": " : "", message ? message : "");
+		RZ_LOG_ERROR("silhouette: server did not accept the current psk%s%s.\n", has_message ? ": " : "", message);
 		return false;
 	case SilStatus_clientNotAuthorized:
-		RZ_LOG_ERROR("silhouette: client was not authorized%s%s.\n", message ? ": " : "", message ? message : "");
+		RZ_LOG_ERROR("silhouette: client was not authorized%s%s.\n", has_message ? ": " : "", message);
 		return false;
 	case SilStatus_versionMismatch:
-		RZ_LOG_ERROR("silhouette: the installed plugin is too old%s%s.\n", message ? ": " : "", message ? message : "");
+		RZ_LOG_ERROR("silhouette: the installed plugin is too old%s%s.\n", has_message ? ": " : "", message);
 		return false;
 	default:
 		RZ_LOG_ERROR("silhouette: could not understand the capnp response from the server %u.\n", status);
