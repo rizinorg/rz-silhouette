@@ -54,18 +54,6 @@ static capn_text sil_capnp_text(const char *text) {
 	return out;
 }
 
-static char *sil_capnp_strdup(capn_text text) {
-	size_t size = text.len > 0 ? (size_t)text.len : 0;
-	char *dup = calloc(sizeof(char), size + 1);
-	if (!dup) {
-		return NULL;
-	}
-	if (size > 0 && text.str) {
-		memcpy(dup, text.str, size);
-	}
-	return dup;
-}
-
 static bool sil_capnp_data_new(struct capn_segment *seg, const ut8 *data, size_t size, capn_data *out) {
 	if (!out) {
 		return false;
@@ -373,7 +361,7 @@ bool sil_protocol_response_recv(RzSocket *socket, sil_response_t *response) {
 	case SilResponse_message: {
 		struct SilMessage text = { 0 };
 		read_SilMessage(&text, message.message);
-		response->text = sil_capnp_strdup(text.text);
+		response->text = rz_str_ndup(text.text.str, text.text.len);
 		break;
 	}
 	case SilResponse_serverInfo: {
@@ -414,8 +402,8 @@ bool sil_protocol_response_recv(RzSocket *socket, sil_response_t *response) {
 			read_SilSymbol(&symbol, match.symbol);
 			response->resolve_result.symbols[i].addr = match.addr;
 			response->resolve_result.symbols[i].exact = match.exact;
-			response->resolve_result.symbols[i].matched_binary_id = sil_capnp_strdup(match.matchedBinaryId);
-			response->resolve_result.symbols[i].matched_by = sil_capnp_strdup(match.matchedBy);
+			response->resolve_result.symbols[i].matched_binary_id = rz_str_ndup(match.matchedBinaryId.str, match.matchedBinaryId.len);
+			response->resolve_result.symbols[i].matched_by = rz_str_ndup(match.matchedBy.str, match.matchedBy.len);
 			response->resolve_result.symbols[i].offset = match.offset;
 			response->resolve_result.symbols[i].size = match.size;
 			response->resolve_result.symbols[i].symbol = sil_symbol_new(
@@ -429,7 +417,7 @@ bool sil_protocol_response_recv(RzSocket *socket, sil_response_t *response) {
 	case SilResponse_shareResult: {
 		struct SilShareResult result = { 0 };
 		read_SilShareResult(&result, message.shareResult);
-		response->share_result.binary_id = sil_capnp_strdup(result.binaryId);
+		response->share_result.binary_id = rz_str_ndup(result.binaryId.str, result.binaryId.len);
 		break;
 	}
 	default:

@@ -12,9 +12,9 @@ Symbol *sil_symbol_new(const char *name, const char *signature, const char *call
 	if (!symbol) {
 		return NULL;
 	}
-	symbol->name = name ? strdup(name) : NULL;
-	symbol->signature = signature ? strdup(signature) : NULL;
-	symbol->callconv = callconv ? strdup(callconv) : NULL;
+	symbol->name = rz_str_dup(name);
+	symbol->signature = rz_str_dup(signature);
+	symbol->callconv = rz_str_dup(callconv);
 	symbol->bits = bits;
 	if ((name && !symbol->name) || (signature && !symbol->signature) || (callconv && !symbol->callconv)) {
 		sil_symbol_free(symbol);
@@ -80,13 +80,20 @@ static void sil_capnp_server_info_fini(sil_server_info_t *info) {
 	memset(info, 0, sizeof(*info));
 }
 
+static void sil_symbol_match_fini(sil_symbol_match_t *match) {
+	if (!match) {
+		return;
+	}
+	free(match->matched_binary_id);
+	free(match->matched_by);
+	sil_symbol_free(match->symbol);
+	memset(match, 0, sizeof(*match));
+}
+
 static void sil_capnp_resolve_result_fini(sil_resolve_result_t *result) {
 	free(result->hints);
 	for (size_t i = 0; i < result->n_symbols; ++i) {
-		sil_symbol_match_t *symbol = &result->symbols[i];
-		free(symbol->matched_binary_id);
-		free(symbol->matched_by);
-		sil_symbol_free(symbol->symbol);
+		sil_symbol_match_fini(&result->symbols[i]);
 	}
 	free(result->symbols);
 	memset(result, 0, sizeof(*result));

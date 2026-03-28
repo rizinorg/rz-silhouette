@@ -7,6 +7,7 @@
  */
 
 #include "sil.h"
+#include "sil_helpers.h"
 #include "sil_protocol.h"
 
 #define SIL_RETRY_TIMES (3)
@@ -28,26 +29,6 @@ typedef struct sil_s {
 
 static SectionHash *sil_section_digest(RzCore *core, RzBinSection *bsect, const RzHashPlugin *blake);
 static Signature *sil_function_to_signature(RzAnalysis *analysis, RzAnalysisFunction *fcn, const char *arch, const RzHashPlugin *blake, size_t max_pattern);
-
-static char *sil_to_lower_dup(const char *original, const char *def_string) {
-	const char *string = RZ_STR_ISEMPTY(original) ? def_string : original;
-	size_t length = strlen(string);
-	char *s = calloc(sizeof(char), length + 1);
-	if (!s) {
-		return NULL;
-	}
-	for (size_t i = 0, j = 0; i < length; ++i) {
-		if (!IS_ALPHANUM(string[i])) {
-			continue;
-		}
-		s[j++] = tolower((ut8)string[i]);
-	}
-	if (strlen(s) < 1) {
-		free(s);
-		return strdup(def_string);
-	}
-	return s;
-}
 
 void sil_free(sil_t *sil) {
 	if (!sil) {
@@ -193,6 +174,14 @@ static ut32 sil_timeout_to_socket_seconds(ut32 timeout_ms) {
 	return (timeout_ms + 999) / 1000;
 }
 
+static char *sil_dup_arch_or_fail(const char *arch) {
+	char *normalized = sil_to_lower_dup(arch, NULL);
+	if (!normalized) {
+		RZ_LOG_ERROR("silhouette: missing or invalid analysis arch\n");
+	}
+	return normalized;
+}
+
 sil_t *sil_new(sil_opt_t *opts) {
 	rz_return_val_if_fail(opts, NULL);
 
@@ -201,9 +190,9 @@ sil_t *sil_new(sil_opt_t *opts) {
 		return NULL;
 	}
 
-	sil->psk = strdup(opts->psk);
-	sil->address = strdup(opts->address);
-	sil->port = strdup(opts->port);
+	sil->psk = rz_str_dup(opts->psk);
+	sil->address = rz_str_dup(opts->address);
+	sil->port = rz_str_dup(opts->port);
 	sil->timeout = opts->timeout;
 	sil->use_tls = opts->use_tls;
 	sil->show_msg = opts->show_msg;
@@ -213,7 +202,7 @@ sil_t *sil_new(sil_opt_t *opts) {
 
 	if (RZ_STR_ISEMPTY(sil->address)) {
 		RZ_LOG_ERROR("silhouette: failed to allocate memory or empty string (address)\n");
-	goto fail;
+		goto fail;
 	} else if (RZ_STR_ISEMPTY(sil->port)) {
 		RZ_LOG_ERROR("silhouette: failed to allocate memory or empty string (port)\n");
 		goto fail;
@@ -414,14 +403,15 @@ static ut64 sil_offset_to_addr(RzCore *core, ut64 offset) {
 }
 
 static RzAnalysisFunction *sil_materialize_function(RzCore *core, ut64 address, ut32 size) {
-	RzAnalysisFunction *func = rz_analysis_get_function_at(core->analysis, address);
+	RzAnalysis *analysis = core->analysis;
+	RzAnalysisFunction *func = rz_analysis_get_function_at(analysis, address);
 	if (func && func->addr == address) {
 		return func;
 	}
 
 	if (!func) {
 		rz_core_analysis_function_add(core, NULL, address, false);
-		func = rz_analysis_get_function_at(core->analysis, address);
+		func = rz_analysis_get_function_at(analysis, address);
 		if (func && func->addr == address) {
 			return func;
 		}
@@ -430,20 +420,28 @@ static RzAnalysisFunction *sil_materialize_function(RzCore *core, ut64 address, 
 	ut64 jump = UT64_MAX;
 	ut64 fail = UT64_MAX;
 	ut32 bb_size = sil_estimate_materialized_bb_size(core, address, size, &jump, &fail);
-	char *tmp_name = rz_str_newf("fcn.sil.%" PFMT64x, address);
-	if (!tmp_name) {
+	bool created = false;
+
+	if (!func || func->addr != address) {
+		func = rz_analysis_create_function(analysis, NULL, address, RZ_ANALYSIS_FCN_TYPE_FCN);
+		if (func) {
+			created = true;
+		} else {
+			func = rz_analysis_get_function_at(analysis, address);
+			if (!func || func->addr != address) {
+				return NULL;
+			}
+		}
+	}
+
+	if (!rz_analysis_fcn_add_bb(analysis, func, address, bb_size, jump, fail)) {
+		if (created) {
+			rz_analysis_function_delete(func);
+		}
 		return NULL;
 	}
-	rz_core_cmdf(core, "af+ %s @ 0x%" PFMT64x, tmp_name, address);
-	if (jump != UT64_MAX && fail != UT64_MAX) {
-		rz_core_cmdf(core, "afb+ 0x%" PFMT64x " 0x%" PFMT64x " %u 0x%" PFMT64x " 0x%" PFMT64x, address, address, (unsigned int)bb_size, jump, fail);
-	} else if (jump != UT64_MAX) {
-		rz_core_cmdf(core, "afb+ 0x%" PFMT64x " 0x%" PFMT64x " %u 0x%" PFMT64x, address, address, (unsigned int)bb_size, jump);
-	} else {
-		rz_core_cmdf(core, "afb+ 0x%" PFMT64x " 0x%" PFMT64x " %u", address, address, (unsigned int)bb_size);
-	}
-	free(tmp_name);
-	func = rz_analysis_get_function_at(core->analysis, address);
+
+	func = rz_analysis_get_function_at(analysis, address);
 	return func && func->addr == address ? func : NULL;
 }
 
@@ -504,28 +502,16 @@ static bool sil_should_query_function_name(const char *name, const char *prefix)
 
 static bool sil_program_bundle_alloc(sil_program_bundle_t *bundle, size_t sections, size_t functions) {
 	memset(bundle, 0, sizeof(*bundle));
-	bundle->sections = sections > 0 ? calloc(sizeof(sil_section_t), sections) : NULL;
-	bundle->functions = functions > 0 ? calloc(sizeof(sil_function_t), functions) : NULL;
+	bundle->sections = sections > 0 ? RZ_NEWS0(sil_section_t, sections) : NULL;
+	bundle->functions = functions > 0 ? RZ_NEWS0(sil_function_t, functions) : NULL;
 	return (sections == 0 || bundle->sections) && (functions == 0 || bundle->functions);
-}
-
-static ut8 *sil_memdup_or_null(const ut8 *data, size_t size) {
-	if (!data || size < 1) {
-		return NULL;
-	}
-	ut8 *dup = malloc(size);
-	if (!dup) {
-		return NULL;
-	}
-	memcpy(dup, data, size);
-	return dup;
 }
 
 static bool sil_copy_section(sil_section_t *dst, const RzBinSection *section, SectionHash *hash) {
 	if (!dst) {
 		return false;
 	}
-	dst->name = section && section->name ? strdup(section->name) : NULL;
+	dst->name = section && section->name ? rz_str_dup(section->name) : NULL;
 	if (section && section->name && !dst->name) {
 		return false;
 	}
@@ -533,7 +519,7 @@ static bool sil_copy_section(sil_section_t *dst, const RzBinSection *section, Se
 	dst->paddr = hash ? hash->paddr : 0;
 	dst->digest_size = hash ? hash->digest.len : 0;
 	if (dst->digest_size > 0) {
-		dst->digest = sil_memdup_or_null(hash->digest.data, dst->digest_size);
+		dst->digest = rz_mem_dup(hash->digest.data, (int)dst->digest_size);
 		if (!dst->digest) {
 			return false;
 		}
@@ -547,13 +533,13 @@ static bool sil_copy_signature(sil_function_t *dst, Signature *signature) {
 	}
 	dst->bits = signature->bits;
 	dst->length = signature->length;
-	dst->arch = signature->arch ? strdup(signature->arch) : NULL;
+	dst->arch = signature->arch ? rz_str_dup(signature->arch) : NULL;
 	if (signature->arch && !dst->arch) {
 		return false;
 	}
 	dst->digest_size = signature->digest.len;
 	if (dst->digest_size > 0) {
-		dst->digest = sil_memdup_or_null(signature->digest.data, dst->digest_size);
+		dst->digest = rz_mem_dup(signature->digest.data, (int)dst->digest_size);
 		if (!dst->digest) {
 			return false;
 		}
@@ -629,9 +615,9 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 		return false;
 	}
 
-	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : strdup("any");
-	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : strdup("any");
-	bundle->arch = sil_to_lower_dup(arch, "any");
+	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : rz_str_dup("any");
+	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : rz_str_dup("any");
+	bundle->arch = sil_dup_arch_or_fail(arch);
 	if (!bundle->binary_type || !bundle->os || !bundle->arch) {
 		return false;
 	}
@@ -649,16 +635,16 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 
 		sil_function_t *dst = &bundle->functions[index];
 		RzBinSection *section = rz_bin_get_section_at(bo, func->addr, rz_config_get_b(core->config, RZ_IO_VA));
-		Signature *signature = sil_function_to_signature(analysis, func, arch, blake, max_size);
+		Signature *signature = sil_function_to_signature(analysis, func, bundle->arch, blake, max_size);
 		if (!signature) {
 			continue;
 		}
 
 		dst->addr = func->addr;
 		dst->size = rz_analysis_function_linear_size(func);
-		dst->name = func->name ? strdup(func->name) : NULL;
+		dst->name = func->name ? rz_str_dup(func->name) : NULL;
 		dst->signature = rz_analysis_function_get_signature(func);
-		dst->callconv = func->cc ? strdup(func->cc) : NULL;
+		dst->callconv = func->cc ? rz_str_dup(func->cc) : NULL;
 		if ((func->name && !dst->name) || (func->cc && !dst->callconv) || !sil_copy_signature(dst, signature)) {
 			sil_signature_free(signature);
 			return false;
@@ -666,7 +652,7 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 
 		if (section) {
 			ut64 section_addr = is_va ? section->vaddr : section->paddr;
-			dst->section_name = section->name ? strdup(section->name) : NULL;
+			dst->section_name = section->name ? rz_str_dup(section->name) : NULL;
 			if (section->name && !dst->section_name) {
 				sil_signature_free(signature);
 				return false;
@@ -719,9 +705,9 @@ static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program
 		return false;
 	}
 
-	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : strdup("any");
-	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : strdup("any");
-	bundle->arch = sil_to_lower_dup(arch, "any");
+	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : rz_str_dup("any");
+	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : rz_str_dup("any");
+	bundle->arch = sil_dup_arch_or_fail(arch);
 	if (!bundle->binary_type || !bundle->os || !bundle->arch) {
 		return false;
 	}
@@ -744,23 +730,23 @@ static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program
 
 		sil_function_t *dst = &bundle->functions[index];
 		RzBinSection *section = rz_bin_get_section_at(bo, symbol->paddr, false);
-		Signature *signature = sil_function_to_signature(analysis, func, arch, blake, max_size);
+		Signature *signature = sil_function_to_signature(analysis, func, bundle->arch, blake, max_size);
 		if (!signature) {
 			continue;
 		}
 
 		dst->addr = func->addr;
 		dst->size = rz_analysis_function_linear_size(func);
-		dst->name = func->name ? strdup(func->name) : NULL;
+		dst->name = func->name ? rz_str_dup(func->name) : NULL;
 		dst->signature = rz_analysis_function_get_signature(func);
-		dst->callconv = func->cc ? strdup(func->cc) : NULL;
+		dst->callconv = func->cc ? rz_str_dup(func->cc) : NULL;
 		if ((func->name && !dst->name) || (func->cc && !dst->callconv) || !sil_copy_signature(dst, signature)) {
 			sil_signature_free(signature);
 			return false;
 		}
 		if (section) {
 			ut64 section_addr = is_va ? section->vaddr : section->paddr;
-			dst->section_name = section->name ? strdup(section->name) : NULL;
+			dst->section_name = section->name ? rz_str_dup(section->name) : NULL;
 			if (section->name && !dst->section_name) {
 				sil_signature_free(signature);
 				return false;
@@ -794,7 +780,7 @@ static void sil_apply_hint_matches(RzCore *core, const sil_resolve_result_t *mat
 		rz_core_analysis_function_add(core, NULL, address, false);
 		func = rz_analysis_get_function_at(core->analysis, address);
 		if (!func || func->addr != address) {
-			rz_core_cmdf(core, "af @ 0x%" PFMT64x, address);
+			rz_core_analysis_function_add(core, NULL, address, true);
 			func = rz_analysis_get_function_at(core->analysis, address);
 		}
 		if (!func) {
@@ -880,7 +866,7 @@ static SectionHash *sil_section_digest(RzCore *core, RzBinSection *bsect, const 
 }
 
 static Signature *sil_function_to_signature(RzAnalysis *analysis, RzAnalysisFunction *fcn, const char *arch, const RzHashPlugin *blake, size_t max_pattern) {
-	size_t linear_size = 0, current = 0, pattern_size = 0;
+	size_t linear_size = 0, pattern_size = 0;
 	ut8 *pattern = NULL, *mask = NULL, *digest = NULL;
 	RzHashSize hash_size = 0;
 	Signature *signature = NULL;
@@ -908,7 +894,7 @@ static Signature *sil_function_to_signature(RzAnalysis *analysis, RzAnalysisFunc
 
 	// apply mask to pattern
 	for (size_t i = 0; i < linear_size; ++i) {
-		pattern[current + i] &= mask[i];
+		pattern[i] &= mask[i];
 	}
 	free(mask);
 
@@ -922,12 +908,13 @@ static Signature *sil_function_to_signature(RzAnalysis *analysis, RzAnalysisFunc
 		free(digest);
 		goto fail;
 	}
-	signature->arch = sil_to_lower_dup(arch, "any");
+	signature->arch = rz_str_dup(arch);
 	signature->bits = fcn->bits;
 	signature->length = linear_size;
 	signature->digest.data = digest;
 	signature->digest.len = hash_size;
-	if (!signature->arch) {
+	if (RZ_STR_ISEMPTY(arch) || !signature->arch) {
+		RZ_LOG_ERROR("silhouette: missing or invalid analysis arch\n");
 		sil_signature_free(signature);
 		signature = NULL;
 	}

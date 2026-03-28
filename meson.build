@@ -126,6 +126,7 @@ rz_silhouette_incs = include_directories('.', 'src')
 rz_silhouette_src = [
   'src' / 'sil_client.c',
   'src' / 'sil_capnp.c',
+  'src' / 'sil_helpers.c',
   'src' / 'sil_plugin.c',
   'src' / 'sil_protocol.c',
   capnp_generated,
