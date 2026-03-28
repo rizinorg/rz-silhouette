@@ -50,6 +50,28 @@ void sil_section_hash_free(SectionHash *section) {
 	free(section);
 }
 
+static void sil_capnp_section_fini(sil_section_t *section) {
+	if (!section) {
+		return;
+	}
+	free(section->name);
+	free(section->digest);
+	memset(section, 0, sizeof(*section));
+}
+
+static void sil_capnp_function_fini(sil_function_t *function) {
+	if (!function) {
+		return;
+	}
+	free(function->arch);
+	free(function->digest);
+	free(function->section_name);
+	free(function->name);
+	free(function->signature);
+	free(function->callconv);
+	memset(function, 0, sizeof(*function));
+}
+
 void sil_capnp_program_fini(sil_program_bundle_t *program) {
 	if (!program) {
 		return;
@@ -59,18 +81,11 @@ void sil_capnp_program_fini(sil_program_bundle_t *program) {
 	free(program->arch);
 	free(program->binary_id);
 	for (size_t i = 0; i < program->n_sections; ++i) {
-		free(program->sections[i].name);
-		free(program->sections[i].digest);
+		sil_capnp_section_fini(&program->sections[i]);
 	}
 	free(program->sections);
 	for (size_t i = 0; i < program->n_functions; ++i) {
-		sil_function_t *function = &program->functions[i];
-		free(function->arch);
-		free(function->digest);
-		free(function->section_name);
-		free(function->name);
-		free(function->signature);
-		free(function->callconv);
+		sil_capnp_function_fini(&program->functions[i]);
 	}
 	free(program->functions);
 	memset(program, 0, sizeof(*program));
