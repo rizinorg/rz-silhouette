@@ -9,6 +9,7 @@
 #include "sil.h"
 #include "sil_helpers.h"
 #include "sil_protocol.h"
+#include <rz_th.h>
 
 #define SIL_RETRY_TIMES (3)
 #define SIL_MATERIALIZE_MAX_BB_SIZE 256U
@@ -27,8 +28,42 @@ typedef struct sil_s {
 	bool can_share_symbols;
 } sil_t;
 
+typedef struct {
+	RzAnalysisFunction *func;
+	ut64 addr;
+	char *name;
+	char *signature;
+	char *callconv;
+	char *section_name;
+	ut64 section_paddr;
+	ut64 section_addr;
+} sil_function_job_t;
+
+typedef struct {
+	RzAnalysis *analysis;
+	const RzHashPlugin *blake;
+	const char *arch;
+	size_t max_pattern;
+} sil_bundle_build_cfg_t;
+
+typedef struct {
+	const sil_function_job_t *jobs;
+	size_t n_jobs;
+	sil_function_t *outputs;
+	bool *ready;
+	const sil_bundle_build_cfg_t *cfg;
+	bool success;
+} sil_bundle_async_ctx_t;
+
+typedef enum {
+	SIL_BUNDLE_ENTRY_SKIP = 0,
+	SIL_BUNDLE_ENTRY_READY,
+	SIL_BUNDLE_ENTRY_ERROR,
+} sil_bundle_entry_status_t;
+
 static SectionHash *sil_section_digest(RzCore *core, RzBinSection *bsect, const RzHashPlugin *blake);
 static Signature *sil_function_to_signature(RzAnalysis *analysis, RzAnalysisFunction *fcn, const char *arch, const RzHashPlugin *blake, size_t max_pattern);
+static bool sil_collect_exec_sections(RzCore *core, sil_program_bundle_t *bundle, const RzHashPlugin *blake);
 
 void sil_free(sil_t *sil) {
 	if (!sil) {
@@ -88,7 +123,7 @@ static void sil_upsert_bin_symbol(RzCore *core, const char *name, ut64 addr, ut6
 	}
 
 	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
-	size_t offset = !strncmp(name, "sym.", strlen("sym.")) ? strlen("sym.") : 0;
+	size_t offset = rz_str_startswith(name, "sym.") ? 4 : 0;
 	ut64 paddr = is_va ? rz_bin_object_v2p(bf->o, addr) : addr;
 	RzBinSymbol *existing = sil_find_bin_symbol(bf, name + offset, addr);
 	if (existing) {
@@ -497,7 +532,7 @@ static bool sil_should_query_function_name(const char *name, const char *prefix)
 	if (RZ_STR_ISEMPTY(name)) {
 		return false;
 	}
-	return strncmp(name, "sym.imp.", strlen("sym.imp."));
+	return !rz_str_startswith(name, "sym.imp.");
 }
 
 static bool sil_program_bundle_alloc(sil_program_bundle_t *bundle, size_t sections, size_t functions) {
@@ -547,6 +582,171 @@ static bool sil_copy_signature(sil_function_t *dst, Signature *signature) {
 	return true;
 }
 
+static void sil_function_job_fini(sil_function_job_t *job) {
+	if (!job) {
+		return;
+	}
+	free(job->name);
+	free(job->signature);
+	free(job->callconv);
+	free(job->section_name);
+	memset(job, 0, sizeof(*job));
+}
+
+static void sil_function_entry_fini(sil_function_t *function) {
+	if (!function) {
+		return;
+	}
+	free(function->arch);
+	free(function->digest);
+	free(function->section_name);
+	free(function->name);
+	free(function->signature);
+	free(function->callconv);
+	memset(function, 0, sizeof(*function));
+}
+
+static bool sil_prepare_function_job(sil_function_job_t *job, RzAnalysisFunction *func, RzBinSection *section, ut64 section_addr) {
+	if (!job || !func) {
+		return false;
+	}
+	job->func = func;
+	job->addr = func->addr;
+	job->name = func->name ? rz_str_dup(func->name) : NULL;
+	job->signature = rz_analysis_function_get_signature(func);
+	job->callconv = func->cc ? rz_str_dup(func->cc) : NULL;
+	job->section_name = section && section->name ? rz_str_dup(section->name) : NULL;
+	job->section_paddr = section ? section->paddr : 0;
+	job->section_addr = section_addr;
+	if ((func->name && !job->name) || (func->cc && !job->callconv) || (section && section->name && !job->section_name)) {
+		sil_function_job_fini(job);
+		return false;
+	}
+	return true;
+}
+
+static sil_bundle_entry_status_t sil_build_function_entry(sil_function_t *dst, const sil_function_job_t *job, const sil_bundle_build_cfg_t *cfg) {
+	if (!dst || !job || !job->func || !cfg) {
+		return SIL_BUNDLE_ENTRY_ERROR;
+	}
+
+	Signature *signature = sil_function_to_signature(cfg->analysis, job->func, cfg->arch, cfg->blake, cfg->max_pattern);
+	if (!signature) {
+		return SIL_BUNDLE_ENTRY_SKIP;
+	}
+
+	sil_function_t local = { 0 };
+	local.addr = job->addr;
+	local.size = signature->length;
+	local.name = job->name ? rz_str_dup(job->name) : NULL;
+	local.signature = job->signature ? rz_str_dup(job->signature) : NULL;
+	local.callconv = job->callconv ? rz_str_dup(job->callconv) : NULL;
+	if ((job->name && !local.name) || (job->signature && !local.signature) || (job->callconv && !local.callconv) || !sil_copy_signature(&local, signature)) {
+		sil_signature_free(signature);
+		sil_function_entry_fini(&local);
+		return SIL_BUNDLE_ENTRY_ERROR;
+	}
+
+	if (job->section_name) {
+		local.section_name = rz_str_dup(job->section_name);
+		if (!local.section_name) {
+			sil_signature_free(signature);
+			sil_function_entry_fini(&local);
+			return SIL_BUNDLE_ENTRY_ERROR;
+		}
+		local.section_paddr = job->section_paddr;
+		if (local.addr >= job->section_addr) {
+			local.section_offset = local.addr - job->section_addr;
+		}
+	}
+
+	sil_signature_free(signature);
+	*dst = local;
+	return SIL_BUNDLE_ENTRY_READY;
+}
+
+static bool sil_build_function_entries_serial(const sil_function_job_t *jobs, size_t n_jobs, const sil_bundle_build_cfg_t *cfg, sil_function_t *outputs, bool *ready) {
+	for (size_t i = 0; i < n_jobs; ++i) {
+		switch (sil_build_function_entry(&outputs[i], &jobs[i], cfg)) {
+		case SIL_BUNDLE_ENTRY_READY:
+			ready[i] = true;
+			break;
+		case SIL_BUNDLE_ENTRY_SKIP:
+			break;
+		case SIL_BUNDLE_ENTRY_ERROR:
+			return false;
+		}
+	}
+	return true;
+}
+
+static void *sil_build_function_entries_thread(sil_bundle_async_ctx_t *ctx) {
+	ctx->success = sil_build_function_entries_serial(ctx->jobs, ctx->n_jobs, ctx->cfg, ctx->outputs, ctx->ready);
+	return NULL;
+}
+
+static size_t sil_compact_function_entries(sil_function_t *functions, bool *ready, size_t n_functions) {
+	size_t out = 0;
+	for (size_t i = 0; i < n_functions; ++i) {
+		if (!ready[i]) {
+			continue;
+		}
+		if (out != i) {
+			functions[out] = functions[i];
+			memset(&functions[i], 0, sizeof(functions[i]));
+		}
+		out++;
+	}
+	return out;
+}
+
+static bool sil_collect_sections_and_populate_functions(RzCore *core, sil_program_bundle_t *bundle, const sil_function_job_t *jobs, size_t n_jobs, const sil_bundle_build_cfg_t *cfg, const RzHashPlugin *blake) {
+	if (n_jobs == 0) {
+		bundle->n_functions = 0;
+		return sil_collect_exec_sections(core, bundle, blake);
+	}
+
+	bool *ready = RZ_NEWS0(bool, n_jobs);
+	if (!ready) {
+		return false;
+	}
+
+	bundle->n_functions = n_jobs;
+	bool success = false;
+	RzThread *thread = NULL;
+	sil_bundle_async_ctx_t ctx = {
+		.jobs = jobs,
+		.n_jobs = n_jobs,
+		.outputs = bundle->functions,
+		.ready = ready,
+		.cfg = cfg,
+		.success = false,
+	};
+	if (n_jobs > 1) {
+		thread = rz_th_new((RzThreadFunction)sil_build_function_entries_thread, &ctx);
+		if (!thread) {
+			RZ_LOG_WARN("silhouette: failed to start bundle worker, falling back to single-threaded build\n");
+		}
+	}
+	RZ_LOG_DEBUG("silhouette: building %zu function entries using %s\n", n_jobs, thread ? "1 background worker thread" : "the main thread");
+
+	bool sections_ok = sil_collect_exec_sections(core, bundle, blake);
+	if (thread) {
+		rz_th_wait(thread);
+		success = ctx.success;
+		rz_th_free(thread);
+	} else {
+		success = sil_build_function_entries_serial(jobs, n_jobs, cfg, bundle->functions, ready);
+	}
+
+	success = success && sections_ok;
+	if (success) {
+		bundle->n_functions = sil_compact_function_entries(bundle->functions, ready, n_jobs);
+	}
+	free(ready);
+	return success;
+}
+
 static bool sil_collect_exec_sections(RzCore *core, sil_program_bundle_t *bundle, const RzHashPlugin *blake) {
 	RzBinObject *bo = rz_bin_cur_object(core->bin);
 	if (!bo) {
@@ -568,10 +768,10 @@ static bool sil_collect_exec_sections(RzCore *core, sil_program_bundle_t *bundle
 			sil_section_hash_free(hash);
 			return false;
 		}
+		bundle->n_sections = index + 1;
 		index++;
 		sil_section_hash_free(hash);
 	}
-	bundle->n_sections = index;
 	return true;
 }
 
@@ -584,6 +784,7 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
 	size_t max_size = rz_config_get_i(core->config, RZ_SIL_PATTERN_SIZE);
 	size_t n_functions = 0;
+	sil_function_job_t *jobs = NULL;
 	RzListIter *it = NULL;
 	RzAnalysisFunction *func = NULL;
 	(void)sil;
@@ -614,18 +815,19 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 	if (!sil_program_bundle_alloc(bundle, n_sections, n_functions)) {
 		return false;
 	}
+	jobs = n_functions > 0 ? RZ_NEWS0(sil_function_job_t, n_functions) : NULL;
+	if (n_functions > 0 && !jobs) {
+		return false;
+	}
 
 	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : rz_str_dup("any");
 	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : rz_str_dup("any");
 	bundle->arch = sil_dup_arch_or_fail(arch);
 	if (!bundle->binary_type || !bundle->os || !bundle->arch) {
+		free(jobs);
 		return false;
 	}
 	bundle->bits = rz_config_get_i(core->config, RZ_ASM_BITS);
-
-	if (!sil_collect_exec_sections(core, bundle, blake)) {
-		return false;
-	}
 
 	size_t index = 0;
 	rz_list_foreach (analysis->fcns, it, func) {
@@ -633,41 +835,28 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 			continue;
 		}
 
-		sil_function_t *dst = &bundle->functions[index];
 		RzBinSection *section = rz_bin_get_section_at(bo, func->addr, rz_config_get_b(core->config, RZ_IO_VA));
-		Signature *signature = sil_function_to_signature(analysis, func, bundle->arch, blake, max_size);
-		if (!signature) {
-			continue;
-		}
-
-		dst->addr = func->addr;
-		dst->size = rz_analysis_function_linear_size(func);
-		dst->name = func->name ? rz_str_dup(func->name) : NULL;
-		dst->signature = rz_analysis_function_get_signature(func);
-		dst->callconv = func->cc ? rz_str_dup(func->cc) : NULL;
-		if ((func->name && !dst->name) || (func->cc && !dst->callconv) || !sil_copy_signature(dst, signature)) {
-			sil_signature_free(signature);
+		if (!sil_prepare_function_job(&jobs[index], func, section, section ? (is_va ? section->vaddr : section->paddr) : 0)) {
+			for (size_t j = 0; j <= index; ++j) {
+				sil_function_job_fini(&jobs[j]);
+			}
+			free(jobs);
 			return false;
 		}
-
-		if (section) {
-			ut64 section_addr = is_va ? section->vaddr : section->paddr;
-			dst->section_name = section->name ? rz_str_dup(section->name) : NULL;
-			if (section->name && !dst->section_name) {
-				sil_signature_free(signature);
-				return false;
-			}
-			dst->section_paddr = section->paddr;
-			if (func->addr >= section_addr) {
-				dst->section_offset = func->addr - section_addr;
-			}
-		}
 		index++;
-		sil_signature_free(signature);
 	}
-
-	bundle->n_functions = index;
-	return true;
+	sil_bundle_build_cfg_t cfg = {
+		.analysis = analysis,
+		.blake = blake,
+		.arch = bundle->arch,
+		.max_pattern = max_size,
+	};
+	bool ok = sil_collect_sections_and_populate_functions(core, bundle, jobs, index, &cfg, blake);
+	for (size_t i = 0; i < index; ++i) {
+		sil_function_job_fini(&jobs[i]);
+	}
+	free(jobs);
+	return ok;
 }
 
 static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program_bundle_t *bundle) {
@@ -678,6 +867,7 @@ static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program
 	bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
 	size_t max_size = rz_config_get_i(core->config, RZ_SIL_PATTERN_SIZE);
 	size_t n_functions = 0;
+	sil_function_job_t *jobs = NULL;
 	void **it = NULL;
 	(void)sil;
 
@@ -704,18 +894,19 @@ static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program
 	if (!sil_program_bundle_alloc(bundle, n_sections, n_functions)) {
 		return false;
 	}
+	jobs = n_functions > 0 ? RZ_NEWS0(sil_function_job_t, n_functions) : NULL;
+	if (n_functions > 0 && !jobs) {
+		return false;
+	}
 
 	bundle->binary_type = bo->plugin ? sil_to_lower_dup(bo->plugin->name, "any") : rz_str_dup("any");
 	bundle->os = bo->info ? sil_to_lower_dup(bo->info->os, "any") : rz_str_dup("any");
 	bundle->arch = sil_dup_arch_or_fail(arch);
 	if (!bundle->binary_type || !bundle->os || !bundle->arch) {
+		free(jobs);
 		return false;
 	}
 	bundle->bits = rz_config_get_i(core->config, RZ_ASM_BITS);
-
-	if (!sil_collect_exec_sections(core, bundle, blake)) {
-		return false;
-	}
 
 	size_t index = 0;
 	rz_pvector_foreach (bo->symbols, it) {
@@ -728,40 +919,28 @@ static bool sil_build_share_program_bundle(sil_t *sil, RzCore *core, sil_program
 			continue;
 		}
 
-		sil_function_t *dst = &bundle->functions[index];
 		RzBinSection *section = rz_bin_get_section_at(bo, symbol->paddr, false);
-		Signature *signature = sil_function_to_signature(analysis, func, bundle->arch, blake, max_size);
-		if (!signature) {
-			continue;
-		}
-
-		dst->addr = func->addr;
-		dst->size = rz_analysis_function_linear_size(func);
-		dst->name = func->name ? rz_str_dup(func->name) : NULL;
-		dst->signature = rz_analysis_function_get_signature(func);
-		dst->callconv = func->cc ? rz_str_dup(func->cc) : NULL;
-		if ((func->name && !dst->name) || (func->cc && !dst->callconv) || !sil_copy_signature(dst, signature)) {
-			sil_signature_free(signature);
+		if (!sil_prepare_function_job(&jobs[index], func, section, section ? (is_va ? section->vaddr : section->paddr) : 0)) {
+			for (size_t j = 0; j <= index; ++j) {
+				sil_function_job_fini(&jobs[j]);
+			}
+			free(jobs);
 			return false;
 		}
-		if (section) {
-			ut64 section_addr = is_va ? section->vaddr : section->paddr;
-			dst->section_name = section->name ? rz_str_dup(section->name) : NULL;
-			if (section->name && !dst->section_name) {
-				sil_signature_free(signature);
-				return false;
-			}
-			dst->section_paddr = section->paddr;
-			if (func->addr >= section_addr) {
-				dst->section_offset = func->addr - section_addr;
-			}
-		}
 		index++;
-		sil_signature_free(signature);
 	}
-
-	bundle->n_functions = index;
-	return true;
+	sil_bundle_build_cfg_t cfg = {
+		.analysis = analysis,
+		.blake = blake,
+		.arch = bundle->arch,
+		.max_pattern = max_size,
+	};
+	bool ok = sil_collect_sections_and_populate_functions(core, bundle, jobs, index, &cfg, blake);
+	for (size_t i = 0; i < index; ++i) {
+		sil_function_job_fini(&jobs[i]);
+	}
+	free(jobs);
+	return ok;
 }
 
 static void sil_apply_hint_matches(RzCore *core, const sil_resolve_result_t *matches, sil_stats_t *stats) {
@@ -841,7 +1020,7 @@ static SectionHash *sil_section_digest(RzCore *core, RzBinSection *bsect, const 
 	bool va = rz_config_get_b(core->config, RZ_IO_VA);
 	ut64 address = va ? bsect->vaddr : bsect->paddr;
 
-	data = calloc(1, bsect->size);
+	data = RZ_NEWS0(ut8, bsect->size);
 	if (!data) {
 		RZ_LOG_ERROR("silhouette: failed to allocate section buffer\n");
 		return NULL;
@@ -877,11 +1056,9 @@ static Signature *sil_function_to_signature(RzAnalysis *analysis, RzAnalysisFunc
 	pattern_size = RZ_MAX(max_pattern, linear_size);
 
 	// allocate pattern buffer
-	if (linear_size < 1 || !(pattern = malloc(pattern_size))) {
+	if (linear_size < 1 || !(pattern = RZ_NEWS0(ut8, pattern_size))) {
 		return NULL;
 	}
-
-	memset(pattern, 0, pattern_size);
 
 	if (!analysis->iob.read_at(analysis->iob.io, fcn->addr, pattern, (int)linear_size)) {
 		goto fail;
