@@ -34,7 +34,7 @@ response delay: 2.5ms
 
 ## Compilation
 
-Install Meson, Ninja, the `capnp` tool, and Rizin development files first, then build from a clean checkout:
+Install Meson, Ninja, and Rizin development files first, then build from a clean checkout:
 
 ```sh
 meson setup builddir
@@ -48,7 +48,18 @@ If `rz_core` is not available through `pkg-config`, pass the Rizin installation 
 meson setup builddir -Drizin_root=/path/to/rizin/prefix
 ```
 
-The client Cap'n Proto C bindings are generated at build time from `src/service.capnp`. Meson uses the bundled `c-capnproto` generator by default; `-Duse_sys_capnp_c=enabled` can be used when a system CapnC runtime and `capnpc-c` are already installed.
+The client ships tracked Cap'n Proto C bindings in `src/service.capnp.c` and `src/service.capnp.h`, and it vendors the Cap'n Proto C runtime sources used by the plugin. Normal builds therefore do not require the `capnp` compiler, `capnpc-c`, or a system CapnC package.
+
+If `src/service.capnp` changes, just regenerate those two files. The repository CI checks that the tracked generated files stay in sync with the schema.
+
+One way to regenerate them manually is:
+
+```sh
+meson subprojects download c-capnproto
+meson setup .ci/capnpc-build subprojects/c-capnproto -Ddefault_library=static -Denable_tests=false
+meson compile -C .ci/capnpc-build capnpc-c
+capnp compile --src-prefix=src -Isrc -o .ci/capnpc-build/capnpc-c:src src/service.capnp
+```
 
 ## Documentation
 

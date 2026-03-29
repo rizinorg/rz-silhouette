@@ -80,41 +80,38 @@ if rizin_plugdir == ''
   endif
 endif
 
-capnp_tool = find_program('capnp', required: true)
 sys_capnp_c_opt = get_option('use_sys_capnp_c')
 capnp_c_dep = disabler()
-capnpc_c = disabler()
+capnp_runtime_sources = []
+capnp_runtime_incs = []
+capnp_c_header_found = false
 if sys_capnp_c_opt.enabled() or sys_capnp_c_opt.auto()
   capnp_c_dep = dependency('CapnC', method: 'cmake', required: false)
   if not capnp_c_dep.found()
+    capnp_c_dep = dependency('c-capnproto', method: 'pkg-config', required: false)
+  endif
+  if not capnp_c_dep.found()
     capnp_c_dep = cc.find_library('CapnC_Runtime', required: false)
   endif
-  capnpc_c = find_program('capnpc-c', required: false)
+  if not capnp_c_dep.found()
+    capnp_c_dep = cc.find_library('capnp_c', required: false)
+  endif
+  if capnp_c_dep.found()
+    capnp_c_header_found = cc.has_header('capnp_c.h', dependencies: [capnp_c_dep])
+  endif
 endif
-if sys_capnp_c_opt.enabled() and (not capnp_c_dep.found() or not capnpc_c.found())
-  error('System CapnC runtime and capnpc-c tool were not found')
+if sys_capnp_c_opt.enabled() and (not capnp_c_dep.found() or not capnp_c_header_found)
+  error('System CapnC runtime and headers were not found')
 endif
-if (sys_capnp_c_opt.auto() and (not capnp_c_dep.found() or not capnpc_c.found())) or sys_capnp_c_opt.disabled()
-  capnp_c_proj = subproject('c-capnproto', default_options: ['default_library=static', 'enable_tests=false'])
-  capnp_c_dep = capnp_c_proj.get_variable('libcapnp_dep')
-  capnpc_c = capnp_c_proj.get_variable('capnpc_c')
+if (sys_capnp_c_opt.auto() and (not capnp_c_dep.found() or not capnp_c_header_found)) or sys_capnp_c_opt.disabled()
+  capnp_c_dep = declare_dependency()
+  capnp_runtime_incs = [include_directories('src/capnp_runtime')]
+  capnp_runtime_sources = [
+    'src' / 'capnp_runtime' / 'capn-malloc.c',
+    'src' / 'capnp_runtime' / 'capn-stream.c',
+    'src' / 'capnp_runtime' / 'capn.c',
+  ]
 endif
-
-capnp_schema_dir = join_paths(meson.current_source_dir(), 'src')
-capnp_generated = custom_target(
-  'service-capnp-c',
-  input: 'src/service.capnp',
-  output: ['service.capnp.c', 'service.capnp.h'],
-  command: [
-    capnp_tool,
-    'compile',
-    '--src-prefix=' + capnp_schema_dir,
-    '-I' + capnp_schema_dir,
-    '-o',
-    capnpc_c,
-    '@INPUT@',
-  ],
-)
 
 rz_silhouette_deps = [
   rz_core_dep,
@@ -122,14 +119,17 @@ rz_silhouette_deps = [
   capnp_c_dep,
 ]
 
-rz_silhouette_incs = include_directories('.', 'src')
+rz_silhouette_incs = [
+  include_directories('.', 'src'),
+] + capnp_runtime_incs
 rz_silhouette_src = [
   'src' / 'sil_client.c',
   'src' / 'sil_capnp.c',
   'src' / 'sil_helpers.c',
   'src' / 'sil_plugin.c',
   'src' / 'sil_protocol.c',
-  capnp_generated,
+] + capnp_runtime_sources + [
+  'src' / 'service.capnp.c',
 ]
 
 if cc.has_argument('-fPIC')
