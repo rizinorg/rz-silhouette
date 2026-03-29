@@ -1,0 +1,3 @@
+[wrap-git]
+url = https://gitlab.com/dkml/ext/c-capnproto.git
+revision = b4e8e6e3ff08ecd276bac57cefbf0f6957e97bc4

@@ -1,2 +1,11 @@
 build/
-subprojects/protobuf-c/
+builddir/
+builddir*/
+compile_commands.json
+.tmp/
+curl-example
+curl-example-dbg
+subprojects/c-capnproto/
+subprojects/packagecache/
+src/service.capnp.c
+src/service.capnp.h

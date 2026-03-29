@@ -66,7 +66,7 @@ static sil_t *sil_plugin_create(RzCore *core) {
 }
 
 RZ_IPI RzCmdStatus sil_command_handler(RzCore *core, int argc, const char **argv) {
-	if (argc < 1) {
+	if (argc < 2) {
 		return RZ_CMD_STATUS_ERROR;
 	}
 
@@ -77,12 +77,10 @@ RZ_IPI RzCmdStatus sil_command_handler(RzCore *core, int argc, const char **argv
 	}
 
 	if (!strcmp(argv[1], "test")) {
-		ut64 start_usec = rz_time_now();
-		result = sil_test_connection(sil);
-		ut64 end_usec = rz_time_now();
+		ut64 elapsed_usec = 0;
+		result = sil_test_connection(sil, &elapsed_usec);
 		if (result) {
-			float delay = end_usec - start_usec;
-			delay /= 1000.f;
+			double delay = (double)elapsed_usec / 1000.0;
 			rz_cons_printf("response delay: %.1fms\n", delay);
 		}
 	} else if (!strcmp(argv[1], "share")) {
@@ -107,9 +105,14 @@ RZ_IPI bool sil_plugin_analysis(RzCore *core) {
 	}
 
 	sil_stats_t stats = { 0 };
-	rz_core_notify_begin(core, "Resolving symbols using the silhouette server...");
+	bool interactive = rz_cons_is_interactive();
+	if (interactive) {
+		rz_core_notify_begin(core, "Resolving symbols using the silhouette server...");
+	}
 	bool result = sil_resolve_functions(sil, core, &stats);
-	rz_core_notify_done(core, "Applied %u hints and %u symbols using the silhouette server.", stats.hints, stats.symbols);
+	if (interactive) {
+		rz_core_notify_done(core, "Applied %u hints and %u symbols using the silhouette server.", stats.hints, stats.symbols);
+	}
 
 	sil_free(sil);
 	return result;

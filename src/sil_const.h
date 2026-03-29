@@ -7,9 +7,10 @@
 
 #define RZ_IO_VA               "io.va"
 #define RZ_ASM_ARCH            "asm.arch"
+#define RZ_ASM_BITS            "asm.bits"
 #define RZ_ANALYSIS_FCN_PREFIX "analysis.fcnprefix"
 
-#define RZ_SIL_VERSION (1)
+#define RZ_SIL_PROTOCOL_VERSION (1)
 
 #define RZ_SIL_ENABLE         "silhouette.enable"
 #define RZ_SIL_ENABLE_DEFAULT false
@@ -53,6 +54,6 @@
 
 #define RZ_SIL_SRV_TEXT         "silhouette.server.message"
 #define RZ_SIL_SRV_TEXT_DEFAULT true
-#define RZ_SIL_SRV_TEXT_DESCR   "When set to true shows any message received by the silhouette server."
+#define RZ_SIL_SRV_TEXT_DESCR   "When set to true shows any message or server info received by the silhouette server."
 
 #endif /* SIL_CONST_H */
