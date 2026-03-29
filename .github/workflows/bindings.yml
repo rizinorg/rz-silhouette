@@ -1,0 +1,37 @@
+name: Bindings
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  capnp-c-bindings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto ninja-build pkg-config python3-pip
+          python3 -m pip install "meson>=1.0.0,<2.0.0"
+
+      - name: Download c-capnproto
+        run: meson subprojects download c-capnproto
+
+      - name: Build capnpc-c
+        run: |
+          meson setup .ci/capnpc-build subprojects/c-capnproto -Ddefault_library=static -Denable_tests=false
+          meson compile -C .ci/capnpc-build capnpc-c
+
+      - name: Regenerate tracked C bindings
+        run: |
+          mkdir -p .ci/generated
+          capnp compile --src-prefix=src -Isrc -o .ci/capnpc-build/capnpc-c:.ci/generated src/service.capnp
+
+      - name: Verify tracked files
+        run: |
+          diff -u src/service.capnp.c .ci/generated/service.capnp.c
+          diff -u src/service.capnp.h .ci/generated/service.capnp.h
