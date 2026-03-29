@@ -1,4 +1,4 @@
-name: Bindings
+name: Verify Cap'n Proto Bindings
 
 on:
   pull_request:
@@ -6,11 +6,14 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
-  capnp-c-bindings:
+  verify-capnp-bindings:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install tools
         run: |
