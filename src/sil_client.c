@@ -393,7 +393,6 @@ static char *propose_function_name(RzAnalysis *analysis, RzAnalysisFunction *fcn
 }
 
 static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *fcn) {
-	RzAnalysis *analysis = core->analysis;
 	const bool is_va = rz_config_get_b(core->config, RZ_IO_VA);
 	const char *prefix = rz_config_get(core->config, RZ_ANALYSIS_FCN_PREFIX);
 	if (RZ_STR_ISEMPTY(prefix)) {
@@ -402,17 +401,16 @@ static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *f
 
 	// remove old flag
 	char *old_prefix = rz_str_newf("%s.", prefix);
-	RzFlagBind *flb = rz_analysis_get_flag_bind(analysis);
-	RzFlagItem *fit = flb->get_at_by_spaces(flb->f, fcn->addr, old_prefix, "data.", NULL);
+	RzFlagItem *fit = rz_flag_get_by_spaces(core->flags, fcn->addr, old_prefix, "data.", NULL);
 	free(old_prefix);
 
 	ut64 size = fit->size;
 	if (fit) {
-		flb->unset(flb->f, fit);
+		rz_flag_unset(core->flags, fit);
 	}
 
 	// set new flag
-	flb->set(flb->f, name, fcn->addr, size);
+	rz_flag_set(core->flags, name, fcn->addr, size);
 
 	(void)is_va;
 	sil_upsert_bin_symbol(core, name, fcn->addr, size);
@@ -423,8 +421,7 @@ static void add_named_flag_at(RzCore *core, const char *name, ut64 addr, ut64 si
 		return;
 	}
 
-	RzFlagBind *flb = rz_analysis_get_flag_bind(core->analysis);
-	flb->set(flb->f, name, addr, size);
+	rz_flag_set(core->flags, name, addr, size);
 
 	sil_upsert_bin_symbol(core, name, addr, size);
 }
