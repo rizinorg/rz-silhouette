@@ -365,7 +365,7 @@ static bool try_rename_function(RzAnalysis *analysis, RzAnalysisFunction *fcn, c
 	if (fcn->type == RZ_ANALYSIS_FCN_TYPE_SYM) {
 		// do not rename if is a symbol but check if
 		// another function has the same name
-		return ht_sp_find(analysis->ht_name_fun, name, NULL) == NULL;
+		return !rz_analysis_function_exists_with_name(analysis, name);
 	}
 	return rz_analysis_function_rename(fcn, name);
 }
@@ -402,16 +402,17 @@ static void add_new_symbol(RzCore *core, const char *name, RzAnalysisFunction *f
 
 	// remove old flag
 	char *old_prefix = rz_str_newf("%s.", prefix);
-	RzFlagItem *fit = analysis->flb.get_at_by_spaces(analysis->flb.f, fcn->addr, old_prefix, "data.", NULL);
+	RzFlagBind *flb = rz_analysis_get_flag_bind(analysis);
+	RzFlagItem *fit = flb->get_at_by_spaces(flb->f, fcn->addr, old_prefix, "data.", NULL);
 	free(old_prefix);
 
 	ut64 size = fit->size;
 	if (fit) {
-		analysis->flb.unset(analysis->flb.f, fit);
+		flb->unset(flb->f, fit);
 	}
 
 	// set new flag
-	analysis->flb.set(analysis->flb.f, name, fcn->addr, size);
+	flb->set(flb->f, name, fcn->addr, size);
 
 	(void)is_va;
 	sil_upsert_bin_symbol(core, name, fcn->addr, size);
@@ -422,7 +423,8 @@ static void add_named_flag_at(RzCore *core, const char *name, ut64 addr, ut64 si
 		return;
 	}
 
-	core->analysis->flb.set(core->analysis->flb.f, name, addr, size);
+	RzFlagBind *flb = rz_analysis_get_flag_bind(core->analysis);
+	flb->set(flb->f, name, addr, size);
 
 	sil_upsert_bin_symbol(core, name, addr, size);
 }
@@ -516,7 +518,7 @@ static void sil_apply_symbol(RzCore *core, RzAnalysisFunction *fcn, Symbol *symb
 	// apply function calling convention
 	if (!RZ_STR_ISEMPTY(symbol->callconv)) {
 		const char *orig = fcn->cc;
-		fcn->cc = rz_str_constpool_get(&core->analysis->constpool, symbol->callconv);
+		fcn->cc = rz_str_constpool_get(rz_analysis_get_const_pool(core->analysis), symbol->callconv);
 		if (!fcn->cc) {
 			fcn->cc = orig;
 			RZ_LOG_ERROR("silhouette: failed to get calling convention for '%s'.\n", name);
@@ -797,7 +799,8 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 		prefix = "fcn";
 	}
 
-	rz_list_foreach (analysis->fcns, it, func) {
+	RzList *fcns = rz_analysis_function_list(analysis);
+	rz_list_foreach (fcns, it, func) {
 		if (sil_should_query_function_name(func->name, prefix)) {
 			n_functions++;
 		}
@@ -831,7 +834,7 @@ static bool sil_build_resolve_program_bundle(sil_t *sil, RzCore *core, sil_progr
 	bundle->bits = rz_config_get_i(core->config, RZ_ASM_BITS);
 
 	size_t index = 0;
-	rz_list_foreach (analysis->fcns, it, func) {
+	rz_list_foreach (fcns, it, func) {
 		if (!sil_should_query_function_name(func->name, prefix)) {
 			continue;
 		}
@@ -1061,7 +1064,8 @@ static Signature *sil_function_to_signature(RzAnalysis *analysis, RzAnalysisFunc
 		return NULL;
 	}
 
-	if (!analysis->iob.read_at(analysis->iob.io, fcn->addr, pattern, (int)linear_size)) {
+	RzIOBind *iob = rz_analysis_get_io_bind(analysis);
+	if (!iob->read_at(iob->io, fcn->addr, pattern, (int)linear_size)) {
 		goto fail;
 	}
 
