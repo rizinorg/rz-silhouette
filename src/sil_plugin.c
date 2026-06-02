@@ -136,7 +136,8 @@ static void sil_setup_evars(RzConfig *cfg) {
 	rz_config_lock(cfg, true);
 }
 
-RZ_IPI bool sil_plugin_init(RzCore *core) {
+RZ_IPI bool sil_plugin_init(RzCore *core, void **user) {
+	(void)user;
 	RzCmd *rcmd = core->rcmd;
 	RzCmdDesc *root_cd = rz_cmd_get_root(rcmd);
 	if (!root_cd) {
@@ -152,7 +153,8 @@ RZ_IPI bool sil_plugin_init(RzCore *core) {
 	return true;
 }
 
-RZ_IPI bool sil_plugin_fini(RzCore *core) {
+RZ_IPI bool sil_plugin_fini(RzCore *core, void *user) {
+	(void)user;
 	RzCmd *cmd = core->rcmd;
 	RzCmdDesc *desc = rz_cmd_get_desc(cmd, "sil");
 	return rz_cmd_desc_remove(cmd, desc);
