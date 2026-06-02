@@ -93,7 +93,8 @@ RZ_IPI RzCmdStatus sil_command_handler(RzCore *core, int argc, const char **argv
 	return result ? RZ_CMD_STATUS_OK : RZ_CMD_STATUS_ERROR;
 }
 
-RZ_IPI bool sil_plugin_analysis(RzCore *core) {
+RZ_IPI bool sil_plugin_analysis(RzCore *core, void *user) {
+	(void)user;
 	bool is_enabled = rz_config_get_b(core->config, RZ_SIL_ENABLE);
 	if (!is_enabled) {
 		return false;
