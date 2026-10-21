@@ -14,7 +14,7 @@
 #define SETPREFB(x, y, z) SETDESC(rz_config_set_b(cfg, x, y), z)
 
 static const RzCmdDescDetailEntry sil_command_group_complete_detail_entries[] = {
-	{ .text = "test", .arg_str = NULL, .comment = "Tries to connect, authenticate and prints the response time." },
+	{ .text = "test", .arg_str = "[j]", .comment = "Tries to connect, authenticate and prints the response time." },
 	{ .text = "share", .arg_str = NULL, .comment = "Tries to share the binary info with the server." },
 	{ 0 },
 };
@@ -76,12 +76,30 @@ RZ_IPI RzCmdStatus sil_command_handler(RzCore *core, int argc, const char **argv
 		return RZ_CMD_STATUS_ERROR;
 	}
 
-	if (!strcmp(argv[1], "test")) {
+	bool test_json = !strcmp(argv[1], "testj");
+	if (!strcmp(argv[1], "test") || test_json) {
+		PJ *pj = test_json ? pj_new() : NULL;
 		ut64 elapsed_usec = 0;
-		result = sil_test_connection(sil, &elapsed_usec);
+		if (pj) {
+			pj_o(pj);
+		}
+
+		result = sil_test_connection(sil, &elapsed_usec, core->cons, pj);
 		if (result) {
 			double delay = (double)elapsed_usec / 1000.0;
-			rz_cons_printf(core->cons, "response delay: %.1fms\n", delay);
+			if (pj) {
+				pj_kd(pj, "response_delay_ms", delay);
+				pj_end(pj);
+				char *json_str = pj_drain(pj);
+				if (json_str) {
+					rz_cons_println(core->cons, json_str);
+					free(json_str);
+				}
+			} else {
+				rz_cons_printf(core->cons, "response delay: %.1fms\n", delay);
+			}
+		} else if (pj) {
+			pj_free(pj);
 		}
 	} else if (!strcmp(argv[1], "share")) {
 		result = sil_share_binary(sil, core);
