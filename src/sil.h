@@ -33,7 +33,7 @@ typedef struct sil_stats_s {
 
 void sil_free(sil_t *sil);
 sil_t *sil_new(sil_opt_t *opts);
-bool sil_test_connection(sil_t *sil, ut64 *elapsed_usec);
+bool sil_test_connection(sil_t *sil, ut64 *elapsed_usec, RzCons *cons, PJ *pj);
 bool sil_share_binary(sil_t *sil, RzCore *core);
 bool sil_resolve_functions(sil_t *sil, RzCore *core, sil_stats_t *stats);
 

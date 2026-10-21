@@ -290,14 +290,20 @@ static bool sil_handle_fail_status(enum SilStatus status, const sil_response_t *
 	}
 }
 
-static void sil_show_server_info(const sil_t *sil, const sil_server_info_t *info) {
+static void sil_show_server_info(const sil_t *sil, const sil_server_info_t *info, RzCons *cons, PJ *pj) {
 	if (!sil || !sil->show_msg || !info) {
 		return;
 	}
-	rz_cons_printf("silhouette server: protocol %u, tls=%s\n",
-		info->version,
-		info->tls_required ? "required" : "optional");
-	rz_cons_flush();
+
+	if (pj) {
+		pj_kn(pj, "protocol_version", info->version);
+		pj_kb(pj, "tls_required", info->tls_required);
+	} else if (cons) {
+		rz_cons_printf(cons, "silhouette server: protocol %u, tls=%s\n",
+			info->version,
+			info->tls_required ? "required" : "optional");
+		rz_cons_flush(cons);
+	}
 }
 
 static void sil_measure_latency_add(ut64 *elapsed_usec, ut64 started_usec) {
@@ -321,7 +327,7 @@ static void sil_measure_latency_add(ut64 *elapsed_usec, ut64 started_usec) {
 		} \
 	} while (0)
 
-static bool sil_ping_handle(sil_t *sil, ut64 *elapsed_usec) {
+static bool sil_ping_handle(sil_t *sil, ut64 *elapsed_usec, RzCons *cons, PJ *pj) {
 	bool result = true;
 	sil_response_t response = { 0 };
 	RzSocket *socket = sil_socket_new(sil);
@@ -344,7 +350,7 @@ static bool sil_ping_handle(sil_t *sil, ut64 *elapsed_usec) {
 	if (response.status != SilStatus_serverInfo) {
 		result = sil_handle_fail_status(response.status, &response);
 	} else {
-		sil_show_server_info(sil, &response.server_info);
+		sil_show_server_info(sil, &response.server_info, cons, pj);
 	}
 
 fail:
@@ -354,11 +360,11 @@ fail:
 	return result;
 }
 
-static bool sil_ping(sil_t *sil, ut64 *elapsed_usec) {
+static bool sil_ping(sil_t *sil, ut64 *elapsed_usec, RzCons *cons, PJ *pj) {
 	if (elapsed_usec) {
 		*elapsed_usec = 0;
 	}
-	return sil_ping_handle(sil, elapsed_usec);
+	return sil_ping_handle(sil, elapsed_usec, cons, pj);
 }
 
 static bool try_rename_function(RzAnalysis *analysis, RzAnalysisFunction *fcn, const char *name) {
@@ -1204,9 +1210,9 @@ end:
 	return result;
 }
 
-bool sil_test_connection(sil_t *sil, ut64 *elapsed_usec) {
+bool sil_test_connection(sil_t *sil, ut64 *elapsed_usec, RzCons *cons, PJ *pj) {
 	rz_return_val_if_fail(sil, false);
-	return sil_ping(sil, elapsed_usec);
+	return sil_ping(sil, elapsed_usec, cons, pj);
 }
 
 bool sil_share_binary(sil_t *sil, RzCore *core) {
