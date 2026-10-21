@@ -14,7 +14,7 @@
 #define SETPREFB(x, y, z) SETDESC(rz_config_set_b(cfg, x, y), z)
 
 static const RzCmdDescDetailEntry sil_command_group_complete_detail_entries[] = {
-	{ .text = "test", .arg_str = "[j]", .comment = "Tries to connect, authenticate and prints the response time." },
+	{ .text = "test[j]", .arg_str = NULL, .comment = "Tries to connect, authenticate and prints the response time." },
 	{ .text = "share", .arg_str = NULL, .comment = "Tries to share the binary info with the server." },
 	{ 0 },
 };
