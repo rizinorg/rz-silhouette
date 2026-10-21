@@ -81,7 +81,7 @@ RZ_IPI RzCmdStatus sil_command_handler(RzCore *core, int argc, const char **argv
 		result = sil_test_connection(sil, &elapsed_usec);
 		if (result) {
 			double delay = (double)elapsed_usec / 1000.0;
-			rz_cons_printf("response delay: %.1fms\n", delay);
+			rz_cons_printf(core->cons, "response delay: %.1fms\n", delay);
 		}
 	} else if (!strcmp(argv[1], "share")) {
 		result = sil_share_binary(sil, core);
@@ -106,7 +106,7 @@ RZ_IPI bool sil_plugin_analysis(RzCore *core, void *user) {
 	}
 
 	sil_stats_t stats = { 0 };
-	bool interactive = rz_cons_is_interactive();
+	bool interactive = rz_cons_is_interactive(core->cons);
 	if (interactive) {
 		rz_core_notify_begin(core, "Resolving symbols using the silhouette server...");
 	}

@@ -294,10 +294,9 @@ static void sil_show_server_info(const sil_t *sil, const sil_server_info_t *info
 	if (!sil || !sil->show_msg || !info) {
 		return;
 	}
-	rz_cons_printf("silhouette server: protocol %u, tls=%s\n",
+	RZ_LOG_INFO("silhouette server: protocol %u, tls=%s\n",
 		info->version,
 		info->tls_required ? "required" : "optional");
-	rz_cons_flush();
 }
 
 static void sil_measure_latency_add(ut64 *elapsed_usec, ut64 started_usec) {
