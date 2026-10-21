@@ -29,7 +29,7 @@ static const RzCmdDescHelp sil_command_group_help = {
 	.details = sil_command_group_complete_details,
 };
 
-static const char *sil_command_choices[] = { "test", "share", NULL };
+static const char *sil_command_choices[] = { "test", "testj", "share", NULL };
 
 static const RzCmdDescArg sil_command_args[] = {
 	{
